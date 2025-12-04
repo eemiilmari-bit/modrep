@@ -2,6 +2,7 @@
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local localPlayer = Players.LocalPlayer
@@ -16,6 +17,7 @@ local loadingLabel = app:WaitForChild("Loading")
 -- New moderator frames
 local reportsRoot = app:WaitForChild("Reports")
 local reportDetailsFrame = app:WaitForChild("ReportDetails")
+local timerLabel = reportDetailsFrame:WaitForChild("Timer") :: TextLabel
 
 local toolbar = app.Parent:WaitForChild("ToolBar")
 local toolbarTabName = toolbar:WaitForChild("TabName")
@@ -82,6 +84,11 @@ local currentBlockTween
 -- Track the tween + state for the dismiss button's Block
 local dismissBlockTween
 local dismissBlockPlayed = false
+
+local timerConnection: RBXScriptConnection?
+local moderatorTimerStart: number? = nil
+local WHITE_COLOR = Color3.new(1, 1, 1)
+local RED_COLOR = Color3.fromRGB(255, 0, 0)
 
 -- Sounds
 local typeSoundTemplate = guiParent:WaitForChild("type")
@@ -182,13 +189,55 @@ local function initSpecialBgToHalf()
 end
 
 local function playSound(soundTemplate: Sound)
-	local clone = soundTemplate:Clone()
-	clone.Parent = soundTemplate.Parent
-	clone:Play()
-	clone.Ended:Connect(function()
-		clone:Destroy()
-	end)
+        local clone = soundTemplate:Clone()
+        clone.Parent = soundTemplate.Parent
+        clone:Play()
+        clone.Ended:Connect(function()
+                clone:Destroy()
+        end)
 end
+
+local function formatSeconds(seconds: number): string
+        seconds = math.max(0, math.floor(seconds))
+        local minutes = math.floor(seconds / 60)
+        local secs = seconds % 60
+        return string.format("%02d:%02d", minutes, secs)
+end
+
+local function stopModeratorTimer()
+        if timerConnection then
+                        timerConnection:Disconnect()
+                        timerConnection = nil
+        end
+
+        moderatorTimerStart = nil
+        timerLabel.Text = "Timer: 00:00"
+        timerLabel.TextColor3 = WHITE_COLOR
+end
+
+local function startModeratorTimer(startTimestamp: number)
+        stopModeratorTimer()
+
+        moderatorTimerStart = startTimestamp
+
+        timerConnection = RunService.RenderStepped:Connect(function()
+                        if not moderatorTimerStart then return end
+
+                        local now = os.time()
+                        local elapsed = math.max(0, now - moderatorTimerStart)
+
+                        timerLabel.Text = string.format("Timer: %s", formatSeconds(elapsed))
+
+                        if elapsed >= 8 * 60 then
+                                local blend = (math.sin(time() * 2) + 1) / 2
+                                timerLabel.TextColor3 = WHITE_COLOR:Lerp(RED_COLOR, blend)
+                        else
+                                timerLabel.TextColor3 = WHITE_COLOR
+                        end
+        end)
+end
+
+stopModeratorTimer()
 
 local function eraseText(textObj: TextLabel)
 	local text = textObj.Text
@@ -1047,15 +1096,17 @@ local function createReportJoinHandler(button: TextButton, joinId: string)
 				if not ok or not result or not result.success then
 					local reason = result and result.reason or "Error"
 					local msg = "Error"
-					if reason == "InvalidJoinId" then
-						msg = "Invalid JoinId"
-					elseif reason == "ServerClosed" then
-						msg = "Server closed"
-					elseif reason == "NotModerator" then
-						msg = "Not moderator"
-					end
-					showTemporaryButtonError(button, msg, 1.8)
-				else
+                                        if reason == "InvalidJoinId" then
+                                                msg = "Invalid JoinId"
+                                        elseif reason == "ServerClosed" then
+                                                msg = "Server closed"
+                                        elseif reason == "NotModerator" then
+                                                msg = "Not moderator"
+                                        elseif reason == "InProgress" then
+                                                msg = "Already in progress"
+                                        end
+                                        showTemporaryButtonError(button, msg, 1.8)
+                                else
 					-- Teleport happens; nothing else to do here.
 				end
 			else
@@ -1248,14 +1299,15 @@ local function refreshModeratorReportsList()
 	if currentReportData and currentReportData.id then
 		if not seenIds[currentReportData.id] then
 			-- The report we’re viewing in details no longer exists (dismissed or server closed)
-			if reportDetailsFrame.Visible then
-				reportDetailsFrame.Visible = false
-				reportsRoot.Visible = true
-				toolbarTabName.Text = "Reports"
-				currentReportData = nil
-			end
-		end
-	end
+                        if reportDetailsFrame.Visible then
+                                reportDetailsFrame.Visible = false
+                                reportsRoot.Visible = true
+                                toolbarTabName.Text = "Reports"
+                                stopModeratorTimer()
+                                currentReportData = nil
+                        end
+                end
+        end
 
 	updateReportsCanvasSize()
 	reportsScrollFrame.CanvasPosition = oldCanvasPosition
@@ -1303,15 +1355,17 @@ do
 				if not ok or not result or not result.success then
 					local reason = result and result.reason or "Error"
 					local msg = "Error"
-					if reason == "InvalidJoinId" then
-						msg = "Invalid JoinId"
-					elseif reason == "ServerClosed" then
-						msg = "Server closed"
-					elseif reason == "NotModerator" then
-						msg = "Not moderator"
-					end
-					showTemporaryButtonError(joinButton, msg, 1.8)
-				else
+                                        if reason == "InvalidJoinId" then
+                                                msg = "Invalid JoinId"
+                                        elseif reason == "ServerClosed" then
+                                                msg = "Server closed"
+                                        elseif reason == "NotModerator" then
+                                                msg = "Not moderator"
+                                        elseif reason == "InProgress" then
+                                                msg = "Already in progress"
+                                        end
+                                        showTemporaryButtonError(joinButton, msg, 1.8)
+                                else
 					-- Teleport is happening now
 				end
 			else
@@ -1399,13 +1453,16 @@ local function openReportDetails(reportData)
 	dismissButton.Interactable = false
 	dismissButton.Active = false
 
-	reportDetailsFrame.Visible = true
+        reportDetailsFrame.Visible = true
 
-	toolbarTabName.Text = "Report details"
+        toolbarTabName.Text = "Report details"
 
-	-- Header label: "Report #x at (time) - ..."
-	local headerLabel = reportDetailsFrame:WaitForChild("Header") :: TextLabel
-	headerLabel.Text = reportData.baseText or ("Report #" .. tostring(reportData.id))
+        local moderatorJoinAt = tonumber(reportData.moderatorJoinAt) or os.time()
+        startModeratorTimer(moderatorJoinAt)
+
+        -- Header label: "Report #x at (time) - ..."
+        local headerLabel = reportDetailsFrame:WaitForChild("Header") :: TextLabel
+        headerLabel.Text = reportData.baseText or ("Report #" .. tostring(reportData.id))
 
 	local reportFrame = reportDetailsFrame:WaitForChild("Report") :: Frame
 	fillReportFrame(reportFrame, reportData, false)
@@ -1477,14 +1534,15 @@ do
 					end
 					showTemporaryButtonError(dismissButton, msg, 1.6)
 					return
-				end
+                                end
 
-				resetDismissButton()
-				currentReportData = nil
+                                resetDismissButton()
+                                stopModeratorTimer()
+                                currentReportData = nil
 
-				-- Go back to report list and refresh
-				reportDetailsFrame.Visible = false
-				reportsRoot.Visible = true
+                                -- Go back to report list and refresh
+                                reportDetailsFrame.Visible = false
+                                reportsRoot.Visible = true
 				toolbarTabName.Text = "Reports"
 				refreshModeratorReportsList()
 			else

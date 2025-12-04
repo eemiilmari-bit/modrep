@@ -36,6 +36,8 @@ local serverReportJoinIds = {}        -- joinId -> true
 -- Track which moderators are currently in this server for a given joinId (handling this report here)
 local moderatorsByJoinId: { [string]: { [number]: boolean } } = {}
 
+local MODERATOR_GRACE_SECONDS = 8 * 60 -- 8 minutes
+
 local random = Random.new()
 
 -- Rahotus compensation event
@@ -102,11 +104,18 @@ local function profileUrl(userId: number): string
 	return string.format("https://www.roblox.com/users/%d/profile", userId)
 end
 
+local function formatDuration(seconds: number): string
+        seconds = math.max(0, math.floor(seconds))
+        local minutes = math.floor(seconds / 60)
+        local secs = seconds % 60
+        return string.format("%02d:%02d", minutes, secs)
+end
+
 -- Simple helper for posting a Discord webhook
 local function sendWebhook(payload: table)
-	task.spawn(function()
-		local okPost, errPost = pcall(function()
-			local json = HttpService:JSONEncode(payload)
+        task.spawn(function()
+                local okPost, errPost = pcall(function()
+                        local json = HttpService:JSONEncode(payload)
 			HttpService:PostAsync(WEBHOOK_URL, json, Enum.HttpContentType.ApplicationJson)
 		end)
 
@@ -244,13 +253,20 @@ local function sendDismissWebhook(record: table?, params: table?)
 		color = 16776960 -- yellow-ish
 	end
 
-	local resolutionText = resolutionNote
-	if type(resolutionText) ~= "string" or resolutionText:gsub("%s+", "") == "" then
-		resolutionText = "No resolution note provided."
-	end
+        local resolutionText = resolutionNote
+        if type(resolutionText) ~= "string" or resolutionText:gsub("%s+", "") == "" then
+                resolutionText = "No resolution note provided."
+        end
 
-	local reporterField = formatReporterFieldFromSnapshot(record.reporter)
-	local targetField = formatTargetFieldFromRecord(record)
+        local dismissedAt = tonumber(record.dismissedAt) or os.time()
+        local createdAt = tonumber(record.createdAt) or dismissedAt
+        local moderatorJoinAt = tonumber(record.moderatorJoinAt)
+
+        local timeFromReport = dismissedAt - createdAt
+        local timeFromModerator = moderatorJoinAt and (dismissedAt - moderatorJoinAt) or nil
+
+        local reporterField = formatReporterFieldFromSnapshot(record.reporter)
+        local targetField = formatTargetFieldFromRecord(record)
 
 	local fields = {}
 
@@ -300,11 +316,29 @@ local function sendDismissWebhook(record: table?, params: table?)
 		inline = false,
 	})
 
-	table.insert(fields, {
-		name = "Reported player",
-		value = targetField,
-		inline = false,
-	})
+        table.insert(fields, {
+                name = "Reported player",
+                value = targetField,
+                inline = false,
+        })
+
+        if auto then
+                table.insert(fields, {
+                        name = "Time taken",
+                        value = string.format("From report time: **%s**", formatDuration(timeFromReport)),
+                        inline = false,
+                })
+        else
+                table.insert(fields, {
+                        name = "Time taken",
+                        value = string.format(
+                                "From report time: **%s**\nFrom moderator: **%s**",
+                                formatDuration(timeFromReport),
+                                timeFromModerator and formatDuration(timeFromModerator) or "N/A"
+                        ),
+                        inline = false,
+                })
+        end
 
 	if moderator then
 		table.insert(fields, {
@@ -417,16 +451,17 @@ local function sanitizeReportForClient(record)
 		return nil
 	end
 
-	return {
-		id = record.id,
-		joinId = record.joinId,
-		baseText = record.baseText,
-		createdAt = record.createdAt,
-		hasReportedPlayer = record.hasReportedPlayer,
-		note = record.note,
-		placeId = record.placeId,
-		jobId = record.jobId,
-		reporter = record.reporter,
+        return {
+                id = record.id,
+                joinId = record.joinId,
+                baseText = record.baseText,
+                createdAt = record.createdAt,
+                moderatorJoinAt = record.moderatorJoinAt,
+                hasReportedPlayer = record.hasReportedPlayer,
+                note = record.note,
+                placeId = record.placeId,
+                jobId = record.jobId,
+                reporter = record.reporter,
 		target = record.target,
 		targetReportCount = record.targetReportCount,
 	}
@@ -455,12 +490,14 @@ local function createReportRecord(args)
 		note = args.note,
 		reporter = args.reporter,
 		target = args.target, -- may be nil
-		hasReportedPlayer = args.hasReportedPlayer,
-		targetUserId = args.targetUserId,
-		targetReportCount = args.targetReportCount or 0,
-		dismissed = false,
-		serverActive = true,
-	}
+                hasReportedPlayer = args.hasReportedPlayer,
+                targetUserId = args.targetUserId,
+                targetReportCount = args.targetReportCount or 0,
+                dismissed = false,
+                serverActive = true,
+                activeModeratorCount = 0,
+                moderatorJoinAt = nil,
+        }
 
 	-- Persist to DataStores (fire-and-forget)
 	task.spawn(function()
@@ -497,6 +534,48 @@ local function createReportRecord(args)
 	serverReportJoinIds[joinId] = true
 
 	return record
+end
+
+local function updateModeratorPresence(joinId: string, delta: number)
+        local record = serverReportsByJoinId[joinId]
+        local reportId = record and record.id
+
+        if not reportId then
+                return
+        end
+
+        local now = os.time()
+        local reportKey = "report_" .. tostring(reportId)
+
+        local okUpdate, updatedRecord = pcall(function()
+                return reportsStore:UpdateAsync(reportKey, function(old)
+                        if not old then
+                                return nil
+                        end
+
+                        local oldCount = tonumber(old.activeModeratorCount) or 0
+                        local newCount = oldCount + delta
+                        if newCount < 0 then
+                                newCount = 0
+                        end
+
+                        old.activeModeratorCount = newCount
+
+                        if newCount > 0 and oldCount == 0 then
+                                old.moderatorJoinAt = now
+                        elseif newCount == 0 then
+                                old.moderatorJoinAt = nil
+                        end
+
+                        return old
+                end)
+        end)
+
+        if okUpdate and updatedRecord then
+                serverReportsByJoinId[joinId] = updatedRecord
+        elseif not okUpdate then
+                warn("Failed to update moderator presence:", updatedRecord)
+        end
 end
 
 validateReportFunc.OnServerInvoke = function(player: Player, targetUserId: number?)
@@ -732,11 +811,12 @@ end
 --///////////////
 
 getReportsFunc.OnServerInvoke = function(player: Player)
-	if not isModerator(player) then
-		return { success = false, reason = "NotModerator" }
-	end
+        if not isModerator(player) then
+                return { success = false, reason = "NotModerator" }
+        end
 
-	local results = {}
+        local results = {}
+        local now = os.time()
 
 	local ok, pages = pcall(function()
 		-- newest first
@@ -757,16 +837,28 @@ getReportsFunc.OnServerInvoke = function(player: Player)
 			return reportsStore:GetAsync(key)
 		end)
 
-		if ok2 and record and record.joinId and not record.dismissed and record.serverActive ~= false and record.jobId then
-			-- verify join mapping still exists
-			local joinOk, joinInfo = pcall(function()
-				return joinLookupStore:GetAsync("join_" .. record.joinId)
-			end)
-			if joinOk and joinInfo and joinInfo.jobId then
-				table.insert(results, sanitizeReportForClient(record))
-			end
-		end
-	end
+                if ok2 and record and record.joinId and not record.dismissed and record.serverActive ~= false and record.jobId then
+                        local activeCount = tonumber(record.activeModeratorCount) or 0
+                        local moderatorJoinAt = tonumber(record.moderatorJoinAt)
+
+                        local locked = false
+                        if activeCount > 0 then
+                                if moderatorJoinAt then
+                                        locked = (now - moderatorJoinAt) < MODERATOR_GRACE_SECONDS
+                                else
+                                        locked = true
+                                end
+                        end
+
+                        -- verify join mapping still exists
+                        local joinOk, joinInfo = pcall(function()
+                                return joinLookupStore:GetAsync("join_" .. record.joinId)
+                        end)
+                        if joinOk and joinInfo and joinInfo.jobId and not locked then
+                                table.insert(results, sanitizeReportForClient(record))
+                        end
+                end
+        end
 
 	return {
 		success = true,
@@ -779,16 +871,18 @@ local function autoDismissReportOnTeleportFail(reportKey: string, joinId: string
 	task.spawn(function()
 		local okUpdate, updatedRecord = pcall(function()
 			return reportsStore:UpdateAsync(reportKey, function(old)
-				if old then
-					old.serverActive = false
-					old.dismissed = true
-					old.dismissReason = reason
-					old.dismissedAt = os.time()
-					return old
-				end
-				return nil
-			end)
-		end)
+                                if old then
+                                        old.serverActive = false
+                                        old.dismissed = true
+                                        old.dismissReason = reason
+                                        old.dismissedAt = os.time()
+                                        old.activeModeratorCount = 0
+                                        old.moderatorJoinAt = nil
+                                        return old
+                                end
+                                return nil
+                        end)
+                end)
 		if not okUpdate then
 			warn("Failed to mark report inactive after teleport fail:", updatedRecord)
 		else
@@ -838,18 +932,33 @@ joinReportFunc.OnServerInvoke = function(player: Player, joinId: string)
 
 	local reportKey = "report_" .. tostring(joinInfo.reportId)
 
-	local okRecord, record = pcall(function()
-		return reportsStore:GetAsync(reportKey)
-	end)
+        local okRecord, record = pcall(function()
+                return reportsStore:GetAsync(reportKey)
+        end)
 
 	if not okRecord then
 		warn("Get report for join failed:", record)
 		return { success = false, reason = "DataStoreError" }
 	end
 
-	if not record or record.dismissed or record.serverActive == false then
-		return { success = false, reason = "InvalidJoinId" }
-	end
+        if not record or record.dismissed or record.serverActive == false then
+                return { success = false, reason = "InvalidJoinId" }
+        end
+
+        local now = os.time()
+        local activeCount = tonumber(record.activeModeratorCount) or 0
+        local moderatorJoinAt = tonumber(record.moderatorJoinAt)
+
+        if activeCount > 0 then
+                local locked = true
+                if moderatorJoinAt then
+                        locked = (now - moderatorJoinAt) < MODERATOR_GRACE_SECONDS
+                end
+
+                if locked then
+                        return { success = false, reason = "InProgress" }
+                end
+        end
 
 	local placeId = joinInfo.placeId or game.PlaceId
 	local jobId = joinInfo.jobId
@@ -965,17 +1074,19 @@ dismissReportFunc.OnServerInvoke = function(player: Player, joinId: string, reso
 			if not old then
 				return nil
 			end
-			old.dismissed = true
-			old.serverActive = false
-			old.dismissedByUserId = player.UserId
-			old.dismissedByUsername = player.Name
-			old.dismissedByDisplayName = player.DisplayName
-			old.dismissedResolutionNote = resolutionNote
-			old.dismissReason = "ManualDismiss"
-			old.dismissedAt = os.time()
-			return old
-		end)
-	end)
+                        old.dismissed = true
+                        old.serverActive = false
+                        old.dismissedByUserId = player.UserId
+                        old.dismissedByUsername = player.Name
+                        old.dismissedByDisplayName = player.DisplayName
+                        old.dismissedResolutionNote = resolutionNote
+                        old.dismissReason = "ManualDismiss"
+                        old.dismissedAt = os.time()
+                        old.activeModeratorCount = 0
+                        old.moderatorJoinAt = nil
+                        return old
+                end)
+        end)
 
 	if not okUpdate then
 		warn("Dismiss report UpdateAsync failed:", updateRes)
@@ -1199,16 +1310,18 @@ local function onPlayerAdded(player: Player)
 				end
 			end
 
-			if record then
-				-- Track this moderator presence for this joinId
-				if isModerator(player) then
-					moderatorsByJoinId[joinId] = moderatorsByJoinId[joinId] or {}
-					moderatorsByJoinId[joinId][player.UserId] = true
-				end
+                        if record then
+                                -- Track this moderator presence for this joinId
+                                if isModerator(player) then
+                                        moderatorsByJoinId[joinId] = moderatorsByJoinId[joinId] or {}
+                                        moderatorsByJoinId[joinId][player.UserId] = true
+                                        updateModeratorPresence(joinId, 1)
+                                        record = serverReportsByJoinId[joinId] or record
+                                end
 
-				-- Send sanitized report data to the moderator's client
-				openReportDetailsEvent:FireClient(player, sanitizeReportForClient(record))
-			else
+                                -- Send sanitized report data to the moderator's client
+                                openReportDetailsEvent:FireClient(player, sanitizeReportForClient(record))
+                        else
 				warn("[ModerationJoin] No report record found for joinId", joinId, "reportId", data.reportId)
 			end
 		end
@@ -1232,15 +1345,17 @@ end
 Players.PlayerAdded:Connect(onPlayerAdded)
 
 Players.PlayerRemoving:Connect(function(player)
-	-- Clear moderator tracking
-	for joinId, set in pairs(moderatorsByJoinId) do
-		if set[player.UserId] then
-			set[player.UserId] = nil
-			if next(set) == nil then
-				moderatorsByJoinId[joinId] = nil
-			end
-		end
-	end
+        -- Clear moderator tracking
+        for joinId, set in pairs(moderatorsByJoinId) do
+                if set[player.UserId] then
+                        set[player.UserId] = nil
+                        if next(set) == nil then
+                                moderatorsByJoinId[joinId] = nil
+                        end
+
+                        updateModeratorPresence(joinId, -1)
+                end
+        end
 end)
 
 -- When this server closes, mark all its reports as inactive and auto-dismiss them
@@ -1251,18 +1366,20 @@ game:BindToClose(function()
 			local key = "report_" .. tostring(record.id)
 			local okUpdate, updatedRecord = pcall(function()
 				return reportsStore:UpdateAsync(key, function(old)
-					if old then
-						old.serverActive = false
-						if not old.dismissed then
-							old.dismissed = true
-							old.dismissReason = "ServerShutdown"
-							old.dismissedAt = os.time()
-						end
-						return old
-					end
-					return nil
-				end)
-			end)
+                                        if old then
+                                                old.serverActive = false
+                                                if not old.dismissed then
+                                                        old.dismissed = true
+                                                        old.dismissReason = "ServerShutdown"
+                                                        old.dismissedAt = os.time()
+                                                end
+                                                old.activeModeratorCount = 0
+                                                old.moderatorJoinAt = nil
+                                                return old
+                                        end
+                                        return nil
+                                end)
+                        end)
 			if not okUpdate then
 				warn("Failed to mark report inactive on shutdown:", updatedRecord)
 			else
