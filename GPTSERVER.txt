@@ -1,0 +1,1285 @@
+-- ServerScriptService.ReportHandler
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local DataStoreService = game:GetService("DataStoreService")
+local TeleportService = game:GetService("TeleportService")
+local MessagingService = game:GetService("MessagingService")
+local ServerStorage = game:GetService("ServerStorage")
+
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1445499200618893466/7LH7b531p-htykdBGMcVGlcC_-c853cn1mk7HZ6ioWAqvKh-9jGtE0mbuDKk5X5RYsqm"
+
+local COOLDOWN_SECONDS = 900 -- 15 minutes; change if you want
+
+local cooldownStore = DataStoreService:GetDataStore("ReportCooldown_v1111111111111111111")
+local reportCountStore = DataStoreService:GetDataStore("PlayerReportCount_v1")
+
+local GLOBAL_REPORT_CHANNEL = "GlobalReportNotifications_v1"
+local MAKE_ROOM_CHANNEL = "ModeratorMakeRoom_v1"
+
+-- New global report stores for moderator UI
+local reportsStore = DataStoreService:GetDataStore("ModeratorReports_v1")
+local reportIndexStore = DataStoreService:GetOrderedDataStore("ModeratorReportsIndex_v1")
+local joinLookupStore = DataStoreService:GetDataStore("ModeratorJoinLookup_v1")
+
+-- New: moderator dismissal stats
+local moderatorDismissStatsStore = DataStoreService:GetDataStore("ModeratorDismissStats_v1")
+
+-- reporterUserId -> { [targetUserId] = true }
+local reportedPairsPerServer = {}
+
+-- Per-server memory of reports for fast lookup when a moderator teleports in
+local serverReportsByJoinId = {}      -- joinId -> reportRecord
+local serverReportJoinIds = {}        -- joinId -> true
+
+-- Track which moderators are currently in this server for a given joinId (handling this report here)
+local moderatorsByJoinId: { [string]: { [number]: boolean } } = {}
+
+local random = Random.new()
+
+-- Rahotus compensation event
+local rahotusEvent = ServerStorage:WaitForChild("rahotus")
+
+-- RemoteFunctions (existing)
+local validateReportFunc = Instance.new("RemoteFunction")
+validateReportFunc.Name = "ValidateReportRequest"
+validateReportFunc.Parent = ReplicatedStorage
+
+local submitReportFunc = Instance.new("RemoteFunction")
+submitReportFunc.Name = "SubmitReportRequest"
+submitReportFunc.Parent = ReplicatedStorage
+
+-- New Remotes for moderator system
+local getReportsFunc = Instance.new("RemoteFunction")
+getReportsFunc.Name = "GetModeratorReports"
+getReportsFunc.Parent = ReplicatedStorage
+
+local joinReportFunc = Instance.new("RemoteFunction")
+joinReportFunc.Name = "JoinReportRequest"
+joinReportFunc.Parent = ReplicatedStorage
+
+local dismissReportFunc = Instance.new("RemoteFunction")
+dismissReportFunc.Name = "DismissReportRequest"
+dismissReportFunc.Parent = ReplicatedStorage
+
+local openReportDetailsEvent = Instance.new("RemoteEvent")
+openReportDetailsEvent.Name = "OpenReportDetails"
+openReportDetailsEvent.Parent = ReplicatedStorage
+
+-- Notification remote for in-game moderators
+local notifyPlayerEvent = ReplicatedStorage:WaitForChild("NotifyPlayer")
+
+-- Group / rank for moderators
+local MODERATOR_GROUP_ID = 35424984
+local MODERATOR_MIN_RANK = 100
+
+local function isModerator(player: Player): boolean
+	local ok, rank = pcall(function()
+		return player:GetRankInGroup(MODERATOR_GROUP_ID)
+	end)
+	if ok and typeof(rank) == "number" and rank >= MODERATOR_MIN_RANK then
+		return true
+	end
+	return false
+end
+
+local function getLeaderstatValue(player: Player, name: string): string
+	local stats = player:FindFirstChild("leaderstats")
+	if not stats then
+		return "N/A"
+	end
+
+	local val = stats:FindFirstChild(name)
+	if val and (val:IsA("IntValue") or val:IsA("NumberValue") or val:IsA("StringValue")) then
+		return tostring(val.Value)
+	end
+
+	return "N/A"
+end
+
+local function profileUrl(userId: number): string
+	return string.format("https://www.roblox.com/users/%d/profile", userId)
+end
+
+-- Simple helper for posting a Discord webhook
+local function sendWebhook(payload: table)
+	task.spawn(function()
+		local okPost, errPost = pcall(function()
+			local json = HttpService:JSONEncode(payload)
+			HttpService:PostAsync(WEBHOOK_URL, json, Enum.HttpContentType.ApplicationJson)
+		end)
+
+		if not okPost then
+			warn("Failed to send webhook:", errPost)
+		end
+	end)
+end
+
+-- Format snapshot (reporter / target) into a Discord field
+local function formatReporterFieldFromSnapshot(snapshot: table?): string
+	if not snapshot then
+		return "Unknown reporter."
+	end
+
+	local userId = snapshot.userId or snapshot.UserId
+	local username = snapshot.username or snapshot.Username or "Unknown"
+	local displayName = snapshot.displayName or snapshot.DisplayName or username
+	local kills = snapshot.kills or snapshot.Kills or "N/A"
+	local euro = snapshot.euro or snapshot.Euro or "N/A"
+
+	local profileLink = "https://www.roblox.com/"
+	if typeof(userId) == "number" then
+		profileLink = profileUrl(userId)
+	end
+
+	return string.format(
+		"[**%s (@%s)**](%s)\nKills: %s | Euro: %s",
+		displayName,
+		username,
+		profileLink,
+		tostring(kills),
+		tostring(euro)
+	)
+end
+
+local function formatTargetFieldFromRecord(record: table?): string
+	if not record or not record.hasReportedPlayer or not record.target then
+		return "No specific player selected."
+	end
+
+	local target = record.target
+	local userId = target.userId or target.UserId
+	local username = target.username or target.Username or "Unknown"
+	local displayName = target.displayName or target.DisplayName or username
+	local kills = target.kills or target.Kills or "N/A"
+	local euro = target.euro or target.Euro or "N/A"
+	local reportCount = target.reportCount or target.Reports or record.targetReportCount or "N/A"
+
+	local profileLink = "https://www.roblox.com/"
+	if typeof(userId) == "number" then
+		profileLink = profileUrl(userId)
+	end
+
+	return string.format(
+		"[**%s (@%s)**](%s)\nKills: %s | Euro: %s\nTotal reports: **%s**",
+		displayName,
+		username,
+		profileLink,
+		tostring(kills),
+		tostring(euro),
+		tostring(reportCount)
+	)
+end
+
+-- Track how many reports a moderator has dismissed
+local function incrementModeratorDismissStats(moderator: Player): { total: number, day: number, week: number }
+	local userId = moderator.UserId
+	local now = os.time()
+
+	local dayStamp = os.date("!*Y%m%d", now) -- e.g. 20251204
+	local weekStamp = os.date("!*Y%W", now) -- e.g. 202549 (year + week)
+
+	local totalKey = "total_" .. userId
+	local dayKey = "day_" .. userId .. "_" .. dayStamp
+	local weekKey = "week_" .. userId .. "_" .. weekStamp
+
+	local stats = {
+		total = 0,
+		day = 0,
+		week = 0,
+	}
+
+	local okTotal, totalVal = pcall(function()
+		return moderatorDismissStatsStore:IncrementAsync(totalKey, 1)
+	end)
+	if okTotal and typeof(totalVal) == "number" then
+		stats.total = totalVal
+	end
+
+	local okDay, dayVal = pcall(function()
+		return moderatorDismissStatsStore:IncrementAsync(dayKey, 1)
+	end)
+	if okDay and typeof(dayVal) == "number" then
+		stats.day = dayVal
+	end
+
+	local okWeek, weekVal = pcall(function()
+		return moderatorDismissStatsStore:IncrementAsync(weekKey, 1)
+	end)
+	if okWeek and typeof(weekVal) == "number" then
+		stats.week = weekVal
+	end
+
+	return stats
+end
+
+-- Webhook for dismissals (manual and auto)
+-- params:
+--   moderator: Player? (nil for auto)
+--   resolutionNote: string? (manual only)
+--   stats: { total, day, week } (manual only)
+--   reason: string (e.g. "ManualDismiss", "TeleportFailed", "ServerShutdown")
+--   auto: boolean
+local function sendDismissWebhook(record: table?, params: table?)
+	if not record then
+		return
+	end
+
+	params = params or {}
+	local moderator: Player? = params.moderator
+	local resolutionNote: string? = params.resolutionNote
+	local stats = params.stats or {}
+	local reason: string = params.reason or "Unknown"
+	local auto: boolean = params.auto == true
+
+	local title
+	local color
+
+	if auto then
+		title = "Report auto-dismissed"
+		color = 15158332 -- red-ish
+	else
+		title = "Report dismissed by moderator"
+		color = 16776960 -- yellow-ish
+	end
+
+	local resolutionText = resolutionNote
+	if type(resolutionText) ~= "string" or resolutionText:gsub("%s+", "") == "" then
+		resolutionText = "No resolution note provided."
+	end
+
+	local reporterField = formatReporterFieldFromSnapshot(record.reporter)
+	local targetField = formatTargetFieldFromRecord(record)
+
+	local fields = {}
+
+	if moderator then
+		local modProfile = profileUrl(moderator.UserId)
+		local modFieldValue = string.format(
+			"[**%s (@%s)**](%s)\nUserId: `%d`",
+			moderator.DisplayName,
+			moderator.Name,
+			modProfile,
+			moderator.UserId
+		)
+
+		table.insert(fields, {
+			name = "Moderator",
+			value = modFieldValue,
+			inline = false,
+		})
+
+		table.insert(fields, {
+			name = "Moderator dismiss stats",
+			value = string.format(
+				"Total dismissed: **%d**\nThis week: **%d**\nToday: **%d**",
+				tonumber(stats.total) or 0,
+				tonumber(stats.week) or 0,
+				tonumber(stats.day) or 0
+			),
+			inline = false,
+		})
+	end
+
+	table.insert(fields, {
+		name = "Report",
+		value = string.format("`%s`", record.baseText or ("Report #" .. tostring(record.id))),
+		inline = false,
+	})
+
+	table.insert(fields, {
+		name = "Original note",
+		value = record.note and ("```markdown\n" .. tostring(record.note) .. "\n```") or "`(none)`",
+		inline = false,
+	})
+
+	table.insert(fields, {
+		name = "Reporter",
+		value = reporterField,
+		inline = false,
+	})
+
+	table.insert(fields, {
+		name = "Reported player",
+		value = targetField,
+		inline = false,
+	})
+
+	if moderator then
+		table.insert(fields, {
+			name = "Resolution",
+			value = "```markdown\n" .. resolutionText .. "\n```",
+			inline = false,
+		})
+	else
+		table.insert(fields, {
+			name = "Auto-dismiss reason",
+			value = reason,
+			inline = false,
+		})
+	end
+
+	table.insert(fields, {
+		name = "Server / Join",
+		value = string.format(
+			"PlaceId: `%d`\nJobId: `%s`\nJoinId: `%s`",
+			record.placeId or game.PlaceId,
+			tostring(record.jobId or "N/A"),
+			tostring(record.joinId or "N/A")
+		),
+		inline = false,
+	})
+
+	local footerText = string.format(
+		"Dismissed at %s (UTC) | Reason: %s",
+		os.date("!%Y-%m-%d %H:%M:%S"),
+		reason
+	)
+
+	local payload = {
+		username = "Moderator Call",
+		embeds = {
+			{
+				title = title,
+				color = color,
+				fields = fields,
+				footer = {
+					text = footerText,
+				},
+			},
+		},
+	}
+
+	sendWebhook(payload)
+end
+
+-- Moderators cannot send reports themselves.
+local function canReport(player: Player, targetUserId: number?)
+	if isModerator(player) then
+		return false, "ModeratorsCantReport"
+	end
+
+	local userId = player.UserId
+	local now = os.time()
+
+	-- datastore-based cooldown
+	local lastTime
+	local ok, err = pcall(function()
+		lastTime = cooldownStore:GetAsync("cooldown_" .. userId)
+	end)
+
+	if not ok then
+		warn("Cooldown GetAsync failed:", err)
+	else
+		if typeof(lastTime) == "number" then
+			local remaining = COOLDOWN_SECONDS - (now - lastTime)
+			if remaining > 0 then
+				return false, "Cooldown", remaining
+			end
+		end
+	end
+
+	-- per-server "same player" rule
+	if targetUserId then
+		reportedPairsPerServer[userId] = reportedPairsPerServer[userId] or {}
+		if reportedPairsPerServer[userId][targetUserId] then
+			return false, "AlreadyReported"
+		end
+	end
+
+	return true
+end
+
+local function generateJoinId(): string
+	local n = random:NextInteger(0, 999999)
+	return string.format("%06d", n)
+end
+
+local function allocateJoinId(): string
+	-- Try a few times to avoid collisions
+	for _ = 1, 6 do
+		local candidate = generateJoinId()
+		local ok, existing = pcall(function()
+			return joinLookupStore:GetAsync("join_" .. candidate)
+		end)
+		if ok and not existing then
+			return candidate
+		end
+	end
+
+	-- Fallback to a short GUID slice
+	return string.sub(HttpService:GenerateGUID(false), 1, 6)
+end
+
+local function sanitizeReportForClient(record)
+	if not record then
+		return nil
+	end
+
+	return {
+		id = record.id,
+		joinId = record.joinId,
+		baseText = record.baseText,
+		createdAt = record.createdAt,
+		hasReportedPlayer = record.hasReportedPlayer,
+		note = record.note,
+		placeId = record.placeId,
+		jobId = record.jobId,
+		reporter = record.reporter,
+		target = record.target,
+		targetReportCount = record.targetReportCount,
+	}
+end
+
+local function createReportRecord(args)
+	-- args: { note, reporter, target, hasReportedPlayer, targetUserId, targetReportCount }
+	local now = os.time()
+
+	-- Use a lightweight unique string id (keeps DS calls lower than a global counter)
+	local id = tostring(now) .. "-" .. tostring(random:NextInteger(100, 999))
+
+	local joinId = allocateJoinId()
+	local statusText = args.hasReportedPlayer and "has reported player" or "No reported player"
+	local timeText = os.date("!%H:%M:%S", now) .. " UTC"
+	local baseText = string.format("Report #%s at %s - %s", id, timeText, statusText)
+
+	local record = {
+		id = id,
+		joinId = joinId,
+		baseText = baseText,
+		statusText = statusText,
+		createdAt = now,
+		placeId = game.PlaceId,
+		jobId = game.JobId,
+		note = args.note,
+		reporter = args.reporter,
+		target = args.target, -- may be nil
+		hasReportedPlayer = args.hasReportedPlayer,
+		targetUserId = args.targetUserId,
+		targetReportCount = args.targetReportCount or 0,
+		dismissed = false,
+		serverActive = true,
+	}
+
+	-- Persist to DataStores (fire-and-forget)
+	task.spawn(function()
+		local key = "report_" .. tostring(id)
+
+		local ok1, err1 = pcall(function()
+			reportsStore:SetAsync(key, record)
+		end)
+		if not ok1 then
+			warn("Failed to save report record:", err1)
+		end
+
+		local ok2, err2 = pcall(function()
+			reportIndexStore:SetAsync(id, now)
+		end)
+		if not ok2 then
+			warn("Failed to index report record:", err2)
+		end
+
+		local ok3, err3 = pcall(function()
+			joinLookupStore:SetAsync("join_" .. joinId, {
+				reportId = id,
+				placeId = game.PlaceId,
+				jobId = game.JobId,
+			})
+		end)
+		if not ok3 then
+			warn("Failed to save joinId lookup:", err3)
+		end
+	end)
+
+	-- Cache in this server
+	serverReportsByJoinId[joinId] = record
+	serverReportJoinIds[joinId] = true
+
+	return record
+end
+
+validateReportFunc.OnServerInvoke = function(player: Player, targetUserId: number?)
+	local ok, reason, remaining = canReport(player, targetUserId)
+	if ok then
+		return { success = true }
+	end
+
+	return {
+		success = false,
+		reason = reason,
+		remaining = remaining,
+	}
+end
+
+submitReportFunc.OnServerInvoke = function(player: Player, targetUserId: number?, note: string)
+	-- sanity checks
+	if type(note) ~= "string" or note:gsub("%s+", "") == "" then
+		return { success = false, reason = "NoNote" }
+	end
+
+	local ok, reason, remaining = canReport(player, targetUserId)
+	if not ok then
+		return {
+			success = false,
+			reason = reason,
+			remaining = remaining,
+		}
+	end
+
+	local now = os.time()
+	local userId = player.UserId
+
+	-- commit cooldown
+	local coolOk, coolErr = pcall(function()
+		cooldownStore:SetAsync("cooldown_" .. userId, now)
+	end)
+	if not coolOk then
+		warn("Failed to set cooldown:", coolErr)
+	end
+
+	-- increment total reports for the target
+	local reportCount = 0
+	if targetUserId then
+		local key = "reports_" .. targetUserId
+		local incOk, incResult = pcall(function()
+			return reportCountStore:IncrementAsync(key, 1)
+		end)
+		if incOk and typeof(incResult) == "number" then
+			reportCount = incResult
+		else
+			warn("Failed to increment report count:", incResult)
+		end
+
+		reportedPairsPerServer[userId] = reportedPairsPerServer[userId] or {}
+		reportedPairsPerServer[userId][targetUserId] = true
+	end
+
+	-- Build reporter / reported snapshots
+	local reporterKills = getLeaderstatValue(player, "Kills")
+	local reporterEuro = getLeaderstatValue(player, "Euro")
+
+	local reporterSnapshot = {
+		userId = player.UserId,
+		username = player.Name,
+		displayName = player.DisplayName,
+		kills = reporterKills,
+		euro = reporterEuro,
+	}
+
+	local reportedPlayer: Player? = nil
+	local reportedKills = "N/A"
+	local reportedEuro = "N/A"
+	local targetSnapshot = nil
+
+	if targetUserId then
+		reportedPlayer = Players:GetPlayerByUserId(targetUserId)
+		if reportedPlayer then
+			reportedKills = getLeaderstatValue(reportedPlayer, "Kills")
+			reportedEuro = getLeaderstatValue(reportedPlayer, "Euro")
+
+			targetSnapshot = {
+				userId = reportedPlayer.UserId,
+				username = reportedPlayer.Name,
+				displayName = reportedPlayer.DisplayName,
+				kills = reportedKills,
+				euro = reportedEuro,
+				reportCount = reportCount,
+			}
+		else
+			-- offline target: we still try to resolve username
+			local username = nil
+			local okName, nameResult = pcall(function()
+				return Players:GetNameFromUserIdAsync(targetUserId)
+			end)
+			if okName then
+				username = nameResult
+			end
+
+			targetSnapshot = {
+				userId = targetUserId,
+				username = username or tostring(targetUserId),
+				displayName = username or tostring(targetUserId),
+				kills = reportedKills,
+				euro = reportedEuro,
+				reportCount = reportCount,
+			}
+		end
+	end
+
+	-- New: create the global report record + joinId
+	local reportRecord = createReportRecord({
+		note = note,
+		reporter = reporterSnapshot,
+		target = targetSnapshot,
+		hasReportedPlayer = targetUserId ~= nil,
+		targetUserId = targetUserId,
+		targetReportCount = reportCount,
+	})
+
+	-- Build webhook payload (now includes joinId)
+	local reportedFieldValue: string
+	if not targetUserId then
+		reportedFieldValue = "No specific player selected."
+	else
+		if reportedPlayer then
+			reportedFieldValue = string.format(
+				"[**%s (@%s)**](%s)\nKills: %s | Euro: %s\nTotal reports: **%d**",
+				reportedPlayer.DisplayName,
+				reportedPlayer.Name,
+				profileUrl(reportedPlayer.UserId),
+				reportedKills,
+				reportedEuro,
+				reportCount
+			)
+		else
+			local uname = targetSnapshot and targetSnapshot.username or tostring(targetUserId)
+			reportedFieldValue = string.format(
+				"UserId: `%d` (@%s)\nTotal reports: **%d**",
+				targetUserId,
+				uname,
+				reportCount
+			)
+		end
+	end
+
+	local payload = {
+		username = "Moderator Call",
+		content = "@here",
+		embeds = {
+			{
+				title = "New Moderator Call",
+				color = 65280, -- green-ish
+				description = string.format("```markdown\n%s\n```", note),
+				fields = {
+					{
+						name = "Reporter",
+						value = string.format(
+							"[**%s (@%s)**](%s)\nKills: %s | Euro: %s",
+							player.DisplayName,
+							player.Name,
+							profileUrl(player.UserId),
+							reporterKills,
+							reporterEuro
+						),
+						inline = false,
+					},
+					{
+						name = "Reported Player",
+						value = reportedFieldValue,
+						inline = false,
+					},
+					{
+						name = "Report",
+						value = string.format("`%s`", reportRecord.baseText or ("Report #" .. tostring(reportRecord.id))),
+						inline = false,
+					},
+					{
+						name = "Server / Join",
+						value = string.format(
+							"PlaceId: `%d`\nJobId: `%s`\nJoinId: `%s`",
+							game.PlaceId,
+							game.JobId,
+							reportRecord.joinId or "N/A"
+						),
+						inline = false,
+					},
+				},
+				footer = {
+					text = string.format("Reported at %s (UTC)", os.date("!%Y-%m-%d %H:%M:%S")),
+				},
+			},
+		},
+	}
+
+	sendWebhook(payload)
+
+	-- Notify active moderators in this server
+	local iconId = "http://www.roblox.com/asset/?id=6089592654"
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if isModerator(plr) then
+			notifyPlayerEvent:FireClient(plr, "Reports", "New report received", iconId, 8)
+		end
+	end
+
+	-- Cross-server notify to other servers' moderators
+	task.spawn(function()
+		local okPub, errPub = pcall(function()
+			MessagingService:PublishAsync(GLOBAL_REPORT_CHANNEL, {
+				type = "NewReport",
+				reportId = reportRecord.id,
+				joinId = reportRecord.joinId,
+				baseText = reportRecord.baseText,
+				sourcePlaceId = game.PlaceId,
+				sourceJobId = game.JobId, -- so we can ignore our own message
+			})
+		end)
+		if not okPub then
+			warn("Failed to publish global report notification:", errPub)
+		end
+	end)
+
+	return {
+		success = true,
+		reportCount = reportCount,
+		joinId = reportRecord.joinId,
+		reportId = reportRecord.id,
+	}
+end
+
+--///////////////
+-- Moderator API
+--///////////////
+
+getReportsFunc.OnServerInvoke = function(player: Player)
+	if not isModerator(player) then
+		return { success = false, reason = "NotModerator" }
+	end
+
+	local results = {}
+
+	local ok, pages = pcall(function()
+		-- newest first
+		return reportIndexStore:GetSortedAsync(false, 50, 0, 2^31 - 1)
+	end)
+
+	if not ok then
+		warn("GetSortedAsync failed:", pages)
+		return { success = false, reason = "DataStoreError" }
+	end
+
+	local page = pages:GetCurrentPage()
+	for _, item in ipairs(page) do
+		local reportId = item.key
+		local key = "report_" .. tostring(reportId)
+
+		local ok2, record = pcall(function()
+			return reportsStore:GetAsync(key)
+		end)
+
+		if ok2 and record and record.joinId and not record.dismissed and record.serverActive ~= false and record.jobId then
+			-- verify join mapping still exists
+			local joinOk, joinInfo = pcall(function()
+				return joinLookupStore:GetAsync("join_" .. record.joinId)
+			end)
+			if joinOk and joinInfo and joinInfo.jobId then
+				table.insert(results, sanitizeReportForClient(record))
+			end
+		end
+	end
+
+	return {
+		success = true,
+		reports = results,
+	}
+end
+
+-- Helper to auto-dismiss on teleport failure
+local function autoDismissReportOnTeleportFail(reportKey: string, joinId: string, reason: string)
+	task.spawn(function()
+		local okUpdate, updatedRecord = pcall(function()
+			return reportsStore:UpdateAsync(reportKey, function(old)
+				if old then
+					old.serverActive = false
+					old.dismissed = true
+					old.dismissReason = reason
+					old.dismissedAt = os.time()
+					return old
+				end
+				return nil
+			end)
+		end)
+		if not okUpdate then
+			warn("Failed to mark report inactive after teleport fail:", updatedRecord)
+		else
+			if updatedRecord then
+				sendDismissWebhook(updatedRecord, {
+					auto = true,
+					reason = reason,
+				})
+			end
+		end
+
+		local okSet, errSet = pcall(function()
+			joinLookupStore:SetAsync("join_" .. joinId, nil)
+		end)
+		if not okSet then
+			warn("Failed to clear join lookup after teleport fail:", errSet)
+		end
+
+		serverReportsByJoinId[joinId] = nil
+		serverReportJoinIds[joinId] = nil
+	end)
+end
+
+joinReportFunc.OnServerInvoke = function(player: Player, joinId: string)
+	if not isModerator(player) then
+		return { success = false, reason = "NotModerator" }
+	end
+
+	if type(joinId) ~= "string" or joinId:gsub("%s", "") == "" then
+		return { success = false, reason = "InvalidJoinId" }
+	end
+
+	joinId = joinId:gsub("%s+", "")
+
+	local okLookup, joinInfo = pcall(function()
+		return joinLookupStore:GetAsync("join_" .. joinId)
+	end)
+
+	if not okLookup then
+		warn("Join lookup failed:", joinInfo)
+		return { success = false, reason = "DataStoreError" }
+	end
+
+	if not joinInfo or not joinInfo.reportId or not joinInfo.jobId then
+		return { success = false, reason = "InvalidJoinId" }
+	end
+
+	local reportKey = "report_" .. tostring(joinInfo.reportId)
+
+	local okRecord, record = pcall(function()
+		return reportsStore:GetAsync(reportKey)
+	end)
+
+	if not okRecord then
+		warn("Get report for join failed:", record)
+		return { success = false, reason = "DataStoreError" }
+	end
+
+	if not record or record.dismissed or record.serverActive == false then
+		return { success = false, reason = "InvalidJoinId" }
+	end
+
+	local placeId = joinInfo.placeId or game.PlaceId
+	local jobId = joinInfo.jobId
+
+	local function attemptTeleport()
+		return pcall(function()
+			TeleportService:TeleportToPlaceInstance(
+				placeId,
+				jobId,
+				player,
+				nil,
+				{
+					ModerationJoin = true,
+					joinId = joinId,
+					reportId = joinInfo.reportId,
+				}
+			)
+		end)
+	end
+
+	-- First attempt
+	local successTeleport, teleportErr = attemptTeleport()
+	if successTeleport then
+		return { success = true }
+	end
+
+	local errStr = tostring(teleportErr or "")
+	local isFull =
+		string.find(errStr, "Full", 1, true) or
+		string.find(errStr, "full", 1, true) or
+		string.find(errStr, "Instance is full", 1, true)
+
+	if isFull then
+		-- Ask the target server (jobId) to free up a slot for this report & moderator
+		task.spawn(function()
+			local okPub, errPub = pcall(function()
+				MessagingService:PublishAsync(MAKE_ROOM_CHANNEL, {
+					type = "MakeRoom",
+					jobId = jobId,
+					joinId = joinId,
+					reportId = joinInfo.reportId,
+					moderatorUserId = player.UserId,
+					moderatorName = player.Name,
+				})
+			end)
+			if not okPub then
+				warn("Failed to publish make-room request:", errPub)
+			end
+		end)
+
+		-- Wait a short moment for the other server to evict a volunteer, then retry once
+		task.wait(3)
+
+		local successTeleport2, teleportErr2 = attemptTeleport()
+		if successTeleport2 then
+			return { success = true }
+		end
+
+		-- Still failing after trying to make room -> treat as closed
+		autoDismissReportOnTeleportFail(reportKey, joinId, "TeleportFailedFullAfterMakeRoom")
+		return { success = false, reason = "ServerClosed" }
+	end
+
+	-- Non-full-related teleport failure -> auto-dismiss as well
+	warn("TeleportToPlaceInstance failed for moderator join:", teleportErr)
+	autoDismissReportOnTeleportFail(reportKey, joinId, "TeleportFailed")
+	return { success = false, reason = "ServerClosed" }
+end
+
+dismissReportFunc.OnServerInvoke = function(player: Player, joinId: string, resolutionNote: string?)
+	if not isModerator(player) then
+		return { success = false, reason = "NotModerator" }
+	end
+
+	if type(joinId) ~= "string" or joinId:gsub("%s", "") == "" then
+		return { success = false, reason = "InvalidJoinId" }
+	end
+
+	joinId = joinId:gsub("%s+", "")
+
+	if type(resolutionNote) ~= "string" then
+		resolutionNote = ""
+	end
+
+	local trimmed = resolutionNote:gsub("%s+", "")
+	if trimmed == "" then
+		resolutionNote = ""
+	end
+
+	local record = serverReportsByJoinId[joinId]
+	local reportId = record and record.id
+
+	if not reportId then
+		local okLookup, lookup = pcall(function()
+			return joinLookupStore:GetAsync("join_" .. joinId)
+		end)
+		if not okLookup then
+			warn("Dismiss join lookup failed:", lookup)
+			return { success = false, reason = "DataStoreError" }
+		end
+		if not lookup or not lookup.reportId then
+			return { success = false, reason = "InvalidJoinId" }
+		end
+		reportId = lookup.reportId
+	end
+
+	local reportKey = "report_" .. tostring(reportId)
+
+	local updatedRecord
+
+	local okUpdate, updateRes = pcall(function()
+		return reportsStore:UpdateAsync(reportKey, function(old)
+			if not old then
+				return nil
+			end
+			old.dismissed = true
+			old.serverActive = false
+			old.dismissedByUserId = player.UserId
+			old.dismissedByUsername = player.Name
+			old.dismissedByDisplayName = player.DisplayName
+			old.dismissedResolutionNote = resolutionNote
+			old.dismissReason = "ManualDismiss"
+			old.dismissedAt = os.time()
+			return old
+		end)
+	end)
+
+	if not okUpdate then
+		warn("Dismiss report UpdateAsync failed:", updateRes)
+		return { success = false, reason = "DataStoreError" }
+	end
+
+	updatedRecord = updateRes
+
+	serverReportsByJoinId[joinId] = nil
+	serverReportJoinIds[joinId] = nil
+
+	-- remove join mapping
+	task.spawn(function()
+		local okUnset, errUnset = pcall(function()
+			joinLookupStore:SetAsync("join_" .. joinId, nil)
+		end)
+		if not okUnset then
+			warn("Failed to clear join lookup on dismiss:", errUnset)
+		end
+	end)
+
+	-- Moderator stats + dismissal webhook
+	local stats = incrementModeratorDismissStats(player)
+	if updatedRecord then
+		sendDismissWebhook(updatedRecord, {
+			moderator = player,
+			resolutionNote = resolutionNote,
+			stats = stats,
+			reason = "ManualDismiss",
+		})
+	end
+
+	return { success = true }
+end
+
+--///////////////
+-- Cross-server Notifications
+--///////////////
+
+-- Subscribe to global report notifications so all servers can alert their moderators
+local function onGlobalReportMessage(message)
+	local data = message.Data
+	if typeof(data) ~= "table" then return end
+	if data.type ~= "NewReport" then return end
+
+	-- Optional: don't re-notify the originating server (we already fire NotifyPlayer there)
+	if data.sourceJobId == game.JobId then
+		return
+	end
+
+	local iconId = "http://www.roblox.com/asset/?id=6089592654"
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if isModerator(plr) then
+			notifyPlayerEvent:FireClient(plr, "Reports", "New report received", iconId, 8)
+		end
+	end
+end
+
+local function onMakeRoomMessage(message)
+	local data = message.Data
+	if typeof(data) ~= "table" then return end
+	if data.type ~= "MakeRoom" then return end
+
+	if data.jobId ~= game.JobId then
+		return
+	end
+
+	local joinId = tostring(data.joinId or "")
+	local reportId = data.reportId
+	local moderatorName = tostring(data.moderatorName or "a moderator")
+
+	if joinId == "" or not reportId then
+		return
+	end
+
+	-- Get report record in this server (cache or DataStore)
+	local record = serverReportsByJoinId[joinId]
+	if not record then
+		local key = "report_" .. tostring(reportId)
+		local ok, stored = pcall(function()
+			return reportsStore:GetAsync(key)
+		end)
+		if ok and stored then
+			record = stored
+			if record.joinId then
+				serverReportsByJoinId[record.joinId] = record
+				serverReportJoinIds[record.joinId] = true
+			end
+		end
+	end
+
+	if not record then
+		warn("[MakeRoom] No report record found in target server for joinId", joinId, "reportId", reportId)
+		return
+	end
+
+	-- If there are already moderators here handling this joinId, don't evict anyone.
+	local modSetForJoin = moderatorsByJoinId[joinId]
+	if modSetForJoin then
+		for _, has in pairs(modSetForJoin) do
+			if has then
+				-- Someone already joined here as a moderator for this report.
+				print("[MakeRoom] Moderator already in server for joinId", joinId, "- not evicting.")
+				return
+			end
+		end
+	end
+
+	-- Build candidate pool: prefer normal players, avoid reporter & reported
+	local reporterId = record.reporter and (record.reporter.userId or record.reporter.UserId)
+	local targetId = record.target and (record.target.userId or record.target.UserId)
+
+	local normalCandidates = {}
+	local moderatorCandidates = {}
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local uid = plr.UserId
+		if uid ~= reporterId and uid ~= targetId then
+			if isModerator(plr) then
+				table.insert(moderatorCandidates, plr)
+			else
+				table.insert(normalCandidates, plr)
+			end
+		end
+	end
+
+	local chosen: Player? = nil
+	if #normalCandidates > 0 then
+		chosen = normalCandidates[random:NextInteger(1, #normalCandidates)]
+	elseif #moderatorCandidates > 0 then
+		chosen = moderatorCandidates[random:NextInteger(1, #moderatorCandidates)]
+	else
+		-- Everyone is reporter/target or no one to move
+		print("[MakeRoom] No suitable volunteer found to move for moderator.")
+		return
+	end
+
+	-- Mark them so combat log script forgives any combat log
+	chosen:SetAttribute("ForcedModSlotTeleport", true)
+	chosen:SetAttribute("ForcedModSlotTeleportModeratorName", moderatorName)
+
+	-- Teleport them to another server of the same place, with TeleportData for compensation
+	local success, err = pcall(function()
+		TeleportService:Teleport(
+			game.PlaceId,
+			chosen,
+			{
+				FreedSlotForModerator = true,
+				ModeratorName = moderatorName,
+				CompensationAmount = 50,
+				CompensationReason = "compensation for volunteering",
+				SourceJobId = game.JobId,
+				SourcePlaceId = game.PlaceId,
+				ReportId = reportId,
+				JoinId = joinId,
+			}
+		)
+	end)
+
+	if not success then
+		warn("[MakeRoom] Failed to teleport volunteer player:", err)
+		-- Clear attributes so PlayerRemoving doesn't treat this as forced if teleport failed
+		chosen:SetAttribute("ForcedModSlotTeleport", nil)
+		chosen:SetAttribute("ForcedModSlotTeleportModeratorName", nil)
+	else
+		print(("[MakeRoom] Moved %s to free a slot for moderator %s."):format(chosen.Name, moderatorName))
+	end
+end
+
+-- Safe subscribes
+do
+	local okSub, subErr = pcall(function()
+		return MessagingService:SubscribeAsync(GLOBAL_REPORT_CHANNEL, onGlobalReportMessage)
+	end)
+	if not okSub then
+		warn("Failed to subscribe to global report notifications:", subErr)
+	end
+
+	local okSub2, subErr2 = pcall(function()
+		return MessagingService:SubscribeAsync(MAKE_ROOM_CHANNEL, onMakeRoomMessage)
+	end)
+	if not okSub2 then
+		warn("Failed to subscribe to make-room channel:", subErr2)
+	end
+end
+
+-- When moderators land in a server via TeleportToPlaceInstance with report data,
+-- open the ReportDetails UI on their client and track moderator presence.
+
+local function onPlayerAdded(player: Player)
+	-- Read join / teleport data correctly on the server
+	local joinData
+	local ok, result = pcall(function()
+		return player:GetJoinData()
+	end)
+
+	if ok and type(result) == "table" then
+		joinData = result
+	end
+
+	local data = joinData and joinData.TeleportData
+
+	if typeof(data) == "table" then
+		-- Moderator join for a report
+		if data.ModerationJoin and data.joinId then
+			local joinId = tostring(data.joinId)
+			local record = serverReportsByJoinId[joinId]
+
+			-- Fallback to DataStore if this server didn't create the report itself
+			if not record and data.reportId then
+				local key = "report_" .. tostring(data.reportId)
+				local ok2, stored = pcall(function()
+					return reportsStore:GetAsync(key)
+				end)
+				if ok2 and stored then
+					record = stored
+					if record.joinId then
+						serverReportsByJoinId[record.joinId] = record
+						serverReportJoinIds[record.joinId] = true
+					end
+				end
+			end
+
+			if record then
+				-- Track this moderator presence for this joinId
+				if isModerator(player) then
+					moderatorsByJoinId[joinId] = moderatorsByJoinId[joinId] or {}
+					moderatorsByJoinId[joinId][player.UserId] = true
+				end
+
+				-- Send sanitized report data to the moderator's client
+				openReportDetailsEvent:FireClient(player, sanitizeReportForClient(record))
+			else
+				warn("[ModerationJoin] No report record found for joinId", joinId, "reportId", data.reportId)
+			end
+		end
+
+		-- Volunteer compensation
+		if data.FreedSlotForModerator then
+			local amount = tonumber(data.CompensationAmount) or 50
+			local reason = tostring(data.CompensationReason or "compensation for volunteering")
+			local okFire, errFire = pcall(function()
+				rahotusEvent:Fire(player, amount, reason)
+			end)
+			if not okFire then
+				warn("[VolunteerComp] Failed to fire rahotus for", player.Name, ":", errFire)
+			else
+				print(("[VolunteerComp] Gave %d to %s (%s)."):format(amount, player.Name, reason))
+			end
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+
+Players.PlayerRemoving:Connect(function(player)
+	-- Clear moderator tracking
+	for joinId, set in pairs(moderatorsByJoinId) do
+		if set[player.UserId] then
+			set[player.UserId] = nil
+			if next(set) == nil then
+				moderatorsByJoinId[joinId] = nil
+			end
+		end
+	end
+end)
+
+-- When this server closes, mark all its reports as inactive and auto-dismiss them
+game:BindToClose(function()
+	for joinId, _ in pairs(serverReportJoinIds) do
+		local record = serverReportsByJoinId[joinId]
+		if record and not record.dismissed then
+			local key = "report_" .. tostring(record.id)
+			local okUpdate, updatedRecord = pcall(function()
+				return reportsStore:UpdateAsync(key, function(old)
+					if old then
+						old.serverActive = false
+						if not old.dismissed then
+							old.dismissed = true
+							old.dismissReason = "ServerShutdown"
+							old.dismissedAt = os.time()
+						end
+						return old
+					end
+					return nil
+				end)
+			end)
+			if not okUpdate then
+				warn("Failed to mark report inactive on shutdown:", updatedRecord)
+			else
+				if updatedRecord then
+					sendDismissWebhook(updatedRecord, {
+						auto = true,
+						reason = "ServerShutdown",
+					})
+				end
+			end
+
+			local okUnset, errUnset = pcall(function()
+				joinLookupStore:SetAsync("join_" .. joinId, nil)
+			end)
+			if not okUnset then
+				warn("Failed to clear join lookup on shutdown:", errUnset)
+			end
+		end
+	end
+end)

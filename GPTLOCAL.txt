@@ -1,0 +1,1559 @@
+-- LocalScript inside App
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local localPlayer = Players.LocalPlayer
+
+local app = script.Parent
+local guiParent = app.Parent -- holds the type/erase sounds
+
+local callForm = app:WaitForChild("CallForm")
+local confirmFrame = app:WaitForChild("SubmitConfirm")
+local loadingLabel = app:WaitForChild("Loading")
+
+-- New moderator frames
+local reportsRoot = app:WaitForChild("Reports")
+local reportDetailsFrame = app:WaitForChild("ReportDetails")
+
+local toolbar = app.Parent:WaitForChild("ToolBar")
+local toolbarTabName = toolbar:WaitForChild("TabName")
+
+local playersFrame = callForm:WaitForChild("PlayersFrame")
+local submitButton = callForm:WaitForChild("Submit")
+local noteInput = callForm:WaitForChild("Note") -- TextBox/TextLabel with the player's note
+
+-- Report details extra UI
+local resolutionNoteInput = reportDetailsFrame:WaitForChild("ResolutionNote") :: TextBox
+local dismissButton = reportDetailsFrame:WaitForChild("Dismiss") :: TextButton
+local dismissBlockFrame = dismissButton:WaitForChild("Block") :: Frame
+
+-- === NEW: store normal / expanded layout for the note ===
+local NOTE_NORMAL_SIZE = noteInput.Size
+local NOTE_NORMAL_POSITION = noteInput.Position
+
+-- Adjust these if you want a different "bigger" note size
+local NOTE_EXPANDED_SIZE = UDim2.new(0.85, 0, NOTE_NORMAL_SIZE.Y.Scale, NOTE_NORMAL_SIZE.Y.Offset)
+local NOTE_EXPANDED_POSITION = NOTE_NORMAL_POSITION -- change if you also want to move it
+-- ========================================================
+
+local confirmNote = confirmFrame:WaitForChild("Note")
+local confirmPlayerFrame = confirmFrame:WaitForChild("PlayerFrame")
+local tempPlayerFrame = callForm:WaitForChild("PlayerFrame")
+local cancelButton = confirmFrame:WaitForChild("Cancel")
+local sendButton = confirmFrame:WaitForChild("Send")
+local blockFrame = sendButton:WaitForChild("Block")
+
+-- Remotes for players creating reports
+local validateReportFunc = ReplicatedStorage:WaitForChild("ValidateReportRequest")
+local submitReportFunc = ReplicatedStorage:WaitForChild("SubmitReportRequest")
+
+-- New remotes for moderators
+local getReportsFunc = ReplicatedStorage:WaitForChild("GetModeratorReports")
+local joinReportFunc = ReplicatedStorage:WaitForChild("JoinReportRequest")
+local dismissReportFunc = ReplicatedStorage:WaitForChild("DismissReportRequest")
+local openReportDetailsEvent = ReplicatedStorage:WaitForChild("OpenReportDetails")
+
+-- Notification event for sounds
+local notifyEvent = ReplicatedStorage:WaitForChild("NotifyPlayer")
+
+-- Moderator detection
+local MODERATOR_GROUP_ID = 35424984
+local MODERATOR_MIN_RANK = 100
+
+local function isModerator(player: Player): boolean
+	local ok, rank = pcall(function()
+		return player:GetRankInGroup(MODERATOR_GROUP_ID)
+	end)
+	if ok and typeof(rank) == "number" and rank >= MODERATOR_MIN_RANK then
+		return true
+	end
+	return false
+end
+
+local IS_MODERATOR = isModerator(localPlayer)
+
+local BLOCK_TRANSPARENCY = 0.5
+
+-- Track the tween we use on the "send" blockFrame
+local currentBlockTween
+
+-- Track the tween + state for the dismiss button's Block
+local dismissBlockTween
+local dismissBlockPlayed = false
+
+-- Sounds
+local typeSoundTemplate = guiParent:WaitForChild("type")
+local eraseSoundTemplate = guiParent:WaitForChild("erase")
+
+-- Frames whose BackgroundTransparency should be 0.5 when "fully visible"
+local SPECIAL_BG_HALF_NAMES = {
+	Header = true,
+	required = true,
+}
+
+local function adjustBackgroundTransparency(obj: Instance, desired: number): number
+	-- For special frames, when "visible" we want 0.5 instead of 0
+	if obj:IsA("Frame") and SPECIAL_BG_HALF_NAMES[obj.Name] then
+		if desired == 0 then
+			return 0.5
+		end
+	end
+	return desired
+end
+
+local function setGuiTransparency(obj: Instance, value: number)
+	if obj:IsA("Frame") or obj:IsA("TextButton") or obj:IsA("TextLabel") or obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+		if obj.BackgroundTransparency ~= nil then
+			obj.BackgroundTransparency = adjustBackgroundTransparency(obj, value)
+		end
+	end
+	if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+		if obj.TextTransparency ~= nil then
+			obj.TextTransparency = value
+		end
+	end
+	if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+		if obj.ImageTransparency ~= nil then
+			obj.ImageTransparency = value
+		end
+	end
+end
+
+local function setChildrenTransparency(container: Instance, value: number, exclude: {[Instance]: boolean}?)
+	for _, obj in ipairs(container:GetDescendants()) do
+		if not (exclude and exclude[obj]) then
+			setGuiTransparency(obj, value)
+		end
+	end
+end
+
+local function tweenChildrenTransparency(container: Instance, to: number, duration: number, exclude: {[Instance]: boolean}?)
+	local firstTween = nil
+
+	for _, obj in ipairs(container:GetDescendants()) do
+		if not (exclude and exclude[obj]) then
+			local goals = {}
+
+			if obj:IsA("Frame") or obj:IsA("TextButton") or obj:IsA("TextLabel") or obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+				if obj.BackgroundTransparency ~= nil then
+					goals.BackgroundTransparency = adjustBackgroundTransparency(obj, to)
+				end
+			end
+
+			if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+				if obj.TextTransparency ~= nil then
+					goals.TextTransparency = to
+				end
+			end
+
+			if obj:IsA("ImageLabel") or obj:IsA("ImageButton") then
+				if obj.ImageTransparency ~= nil then
+					goals.ImageTransparency = to
+				end
+			end
+
+			if next(goals) ~= nil then
+				local tween = TweenService:Create(
+					obj,
+					TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+					goals
+				)
+				tween:Play()
+
+				if not firstTween then
+					firstTween = tween
+				end
+			end
+		end
+	end
+
+	return firstTween
+end
+
+-- Force all special frames under callForm to 0.5 once (helps initial state)
+local function initSpecialBgToHalf()
+	for _, obj in ipairs(callForm:GetDescendants()) do
+		if obj:IsA("Frame") and SPECIAL_BG_HALF_NAMES[obj.Name] then
+			obj.BackgroundTransparency = 0.5
+		end
+	end
+end
+
+local function playSound(soundTemplate: Sound)
+	local clone = soundTemplate:Clone()
+	clone.Parent = soundTemplate.Parent
+	clone:Play()
+	clone.Ended:Connect(function()
+		clone:Destroy()
+	end)
+end
+
+local function eraseText(textObj: TextLabel)
+	local text = textObj.Text
+	for i = #text, 0, -1 do
+		textObj.Text = text:sub(1, i)
+		playSound(eraseSoundTemplate)
+		task.wait(0.05)
+	end
+end
+
+local function typeText(textObj: TextLabel, finalText: string)
+	textObj.Text = ""
+	for i = 1, #finalText do
+		textObj.Text = finalText:sub(1, i)
+		playSound(typeSoundTemplate)
+		task.wait(0.05)
+	end
+end
+
+local function showTemporaryButtonError(button: TextButton, message: string, duration: number?)
+	duration = duration or 1.5
+	local originalText = button.Text
+	
+	if button.Name == "Dismiss" then
+		originalText = "Dismiss"
+	end
+	
+	if button.Name == "Send" then
+		originalText = "Send"
+	end
+	local originalColor = button.TextColor3
+
+	button.Text = message
+	button.Interactable = false
+	button.TextColor3 = Color3.fromRGB(255, 80, 80)
+	button.AutoButtonColor = false
+
+	task.delay(duration, function()
+		button.Interactable = true
+		button.Text = originalText
+		button.TextColor3 = originalColor
+		button.AutoButtonColor = true
+	end)
+end
+
+-- Player list dropdown state (for normal players only)
+local playerEntries = {} :: { [Player]: { row: TextButton, baseText: string, detailsFrame: Frame?, open: boolean } }
+local selectedPlayer: Player? = nil
+
+local normalButtonColor = Color3.fromRGB(35, 35, 35)
+local selectedButtonColor = Color3.fromRGB(0, 170, 0)
+
+-- Ensure we have a layout in the players frame
+local layout = playersFrame:FindFirstChildOfClass("UIListLayout")
+if not layout then
+	layout = Instance.new("UIListLayout")
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 4)
+	layout.Parent = playersFrame
+end
+
+local function clearPlayerEntries()
+	for _, entry in pairs(playerEntries) do
+		if entry.row then
+			entry.row:Destroy()
+		end
+		if entry.detailsFrame then
+			entry.detailsFrame:Destroy()
+		end
+	end
+	table.clear(playerEntries)
+	selectedPlayer = nil
+end
+
+local function fillPlayerFrame(frame: Frame, player: Player)
+	local killsLabel = frame:FindFirstChild("Kills", true)
+	local euroLabel = frame:FindFirstChild("Euro", true)
+	local usernameLabel = frame:FindFirstChild("Username", true)
+	local displayLabel = frame:FindFirstChild("DisplayName", true)
+	local headshotImage = frame:FindFirstChild("Headshot", true)
+
+	if usernameLabel and usernameLabel:IsA("TextLabel") then
+		usernameLabel.Text = "@" .. player.Name
+	end
+
+	if displayLabel and displayLabel:IsA("TextLabel") then
+		displayLabel.Text = player.DisplayName
+	end
+
+	local stats = player:FindFirstChild("leaderstats")
+	if stats then
+		local killsVal = stats:FindFirstChild("Kills")
+		local euroVal = stats:FindFirstChild("Euro")
+		if killsLabel and killsLabel:IsA("TextLabel") and killsVal then
+			killsLabel.Text = tostring(killsVal.Value)
+		end
+		if euroLabel and euroLabel:IsA("TextLabel") and euroVal then
+			euroLabel.Text = tostring(euroVal.Value)
+		end
+	end
+
+	if headshotImage and headshotImage:IsA("ImageLabel") then
+		local ok, content = pcall(function()
+			return Players:GetUserThumbnailAsync(
+				player.UserId,
+				Enum.ThumbnailType.HeadShot,
+				Enum.ThumbnailSize.Size100x100
+			)
+		end)
+		if ok then
+			headshotImage.Image = content
+		end
+	end
+end
+
+local function createPlayerEntry(player: Player, index: number)
+	local row = Instance.new("TextButton")
+	row.Name = player.Name .. "_Row"
+	row.Size = UDim2.new(1, 0, 0, 28)
+	row.TextColor3 = Color3.new(1, 1, 1)
+	row.LayoutOrder = index * 2
+	row.BackgroundColor3 = normalButtonColor
+	row.BorderSizePixel = 0
+	row.AutoButtonColor = true
+
+	-- base text (player name / @name)
+	local baseText: string
+	if player.DisplayName == player.Name then
+		baseText = "@" .. player.Name
+	else
+		baseText = player.DisplayName .. " (@" .. player.Name .. ")"
+	end
+
+	-- closed by default -> arrow on left in the SAME text as the button
+	row.Text = "▶ " .. baseText
+
+	row.TextXAlignment = Enum.TextXAlignment.Left
+	row.TextSize = 16
+	row.Font = Enum.Font.SourceSans
+	row.Parent = playersFrame
+
+	local entry = {
+		row = row,
+		baseText = baseText,
+		detailsFrame = nil,
+		open = false,
+	}
+	playerEntries[player] = entry
+
+	local function closeEntry()
+		if not entry.open then return end
+
+		entry.open = false
+		row.BackgroundColor3 = normalButtonColor
+		row.Text = "▶ " .. entry.baseText
+
+		if entry.detailsFrame then
+			entry.detailsFrame:Destroy()
+			entry.detailsFrame = nil
+		end
+		if selectedPlayer == player then
+			selectedPlayer = nil
+		end
+	end
+
+	local function openEntry()
+		-- close previously selected
+		if selectedPlayer and selectedPlayer ~= player then
+			local prev = playerEntries[selectedPlayer]
+			if prev then
+				if prev.detailsFrame then
+					prev.detailsFrame:Destroy()
+					prev.detailsFrame = nil
+				end
+				prev.open = false
+				prev.row.BackgroundColor3 = normalButtonColor
+				prev.row.Text = "▶ " .. prev.baseText
+			end
+		end
+
+		selectedPlayer = player
+		entry.open = true
+		row.BackgroundColor3 = selectedButtonColor
+		row.Text = "▼ " .. entry.baseText
+
+		local clone = tempPlayerFrame:Clone()
+		clone.Name = player.Name .. "_Detail"
+		clone.Visible = true
+		clone.LayoutOrder = row.LayoutOrder + 1
+		clone.Parent = playersFrame
+
+		-- FILL LEADERSTATS HERE
+		fillPlayerFrame(clone, player)
+
+		entry.detailsFrame = clone
+	end
+
+	row.MouseButton1Click:Connect(function()
+		if entry.open then
+			closeEntry()
+		else
+			openEntry()
+		end
+	end)
+end
+
+-- === MODIFIED: refreshPlayerList now also hides/shows the list and resizes the note ===
+local function refreshPlayerList()
+	if IS_MODERATOR then
+		-- Moderators don't report, so no player list is needed.
+		clearPlayerEntries()
+		playersFrame.Visible = false
+		callForm.PlayerHeader.Visible = false
+		callForm.Filler2.Visible = false
+		return
+	end
+
+	-- Track which players are currently in the server (excluding local)
+	local currentPlayers = {}
+	local index = 0
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= localPlayer then
+			index += 1
+			currentPlayers[plr] = true
+
+			local entry = playerEntries[plr]
+			if not entry then
+				-- New player: create row + entry
+				createPlayerEntry(plr, index)
+				entry = playerEntries[plr]
+			end
+
+			-- Update ordering for existing entries
+			if entry and entry.row then
+				entry.row.LayoutOrder = index * 2
+				if entry.detailsFrame then
+					entry.detailsFrame.LayoutOrder = entry.row.LayoutOrder + 1
+				end
+			end
+		end
+	end
+
+	-- Remove rows for players that have left
+	for plr, entry in pairs(playerEntries) do
+		if not currentPlayers[plr] then
+			if entry.row then
+				entry.row:Destroy()
+			end
+			if entry.detailsFrame then
+				entry.detailsFrame:Destroy()
+			end
+			playerEntries[plr] = nil
+			if selectedPlayer == plr then
+				selectedPlayer = nil
+			end
+		end
+	end
+
+	-- Adjust visibility + note size
+	if index == 0 then
+		-- No other players: hide the list and make the note bigger
+		playersFrame.Visible = false
+		callForm.PlayerHeader.Visible = false
+		callForm.Filler2.Visible = false
+		noteInput.Size = NOTE_EXPANDED_SIZE
+		noteInput.Position = NOTE_EXPANDED_POSITION
+		selectedPlayer = nil
+	else
+		-- There are reportable players: show list and use normal note size
+		playersFrame.Visible = true
+		callForm.Filler2.Visible = true
+		callForm.PlayerHeader.Visible = true
+		noteInput.Size = NOTE_NORMAL_SIZE
+		noteInput.Position = NOTE_NORMAL_POSITION
+	end
+end
+-- ======================================================================
+
+if not IS_MODERATOR then
+	Players.PlayerAdded:Connect(refreshPlayerList)
+	Players.PlayerRemoving:Connect(refreshPlayerList)
+end
+refreshPlayerList()
+initSpecialBgToHalf() -- ensure Header/required are 0.5 initially
+
+-- Remote validation helper
+local function validateReport(targetUserId: number?)
+	local ok, result = pcall(function()
+		return validateReportFunc:InvokeServer(targetUserId)
+	end)
+	if not ok then
+		warn("ValidateReport failed:", result)
+		return false, "Error"
+	end
+
+	if result and result.success then
+		return true
+	end
+
+	local reason = result and result.reason or "Error"
+	return false, reason, result and result.remaining
+end
+
+local function goToConfirm()
+	if IS_MODERATOR then
+		return
+	end
+
+	local noteText = noteInput.Text or ""
+	confirmNote.Text = noteText
+
+	if selectedPlayer then
+		confirmPlayerFrame.Visible = true
+		fillPlayerFrame(confirmPlayerFrame, selectedPlayer)
+		confirmNote.Position = UDim2.new(0.069, 0, 0.269, 0)
+	else
+		confirmPlayerFrame.Visible = false
+		confirmNote.Position = UDim2.new(0.301, 0, 0.262, 0)
+	end
+
+	-- make sure both forms are visible for the cross-fade
+	callForm.Visible = true
+	confirmFrame.Visible = true
+
+	local exclude = { [blockFrame] = true }
+
+	-- starting state:
+	setChildrenTransparency(callForm, 0, exclude)
+	setChildrenTransparency(confirmFrame, 1, exclude)
+
+	local out = tweenChildrenTransparency(callForm, 1, 0.15, exclude)
+	tweenChildrenTransparency(confirmFrame, 0, 0.15, exclude)
+
+	if out then
+		out.Completed:Connect(function()
+			callForm.Visible = false
+			-- reset for next time (visible state = 0 / 0.5 for special frames)
+			setChildrenTransparency(callForm, 0)
+		end)
+	else
+		callForm.Visible = false
+	end
+
+	-- Cancel old tween if any
+	if currentBlockTween then
+		currentBlockTween:Cancel()
+		currentBlockTween = nil
+	end
+
+	blockFrame.Visible = true
+	blockFrame.Size = UDim2.new(1, 0, 1, 0)
+	blockFrame.BackgroundTransparency = BLOCK_TRANSPARENCY
+
+	toolbarTabName.Text = "Confirmation"
+
+	sendButton.Active = false
+	sendButton.Interactable = false
+	sendButton.AutoButtonColor = false
+
+	local tween = TweenService:Create(
+		blockFrame,
+		TweenInfo.new(3, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+		{ Size = UDim2.new(0, 0, 1, 0) }
+	)
+	currentBlockTween = tween
+	tween:Play()
+
+	tween.Completed:Connect(function()
+		if currentBlockTween ~= tween then return end
+		currentBlockTween = nil
+
+		blockFrame.Visible = false
+		sendButton.Active = true
+		sendButton.Interactable = true
+		sendButton.AutoButtonColor = true
+	end)
+end
+
+local function backToForm()
+	if IS_MODERATOR then
+		return
+	end
+
+	if currentBlockTween then
+		currentBlockTween:Cancel()
+		currentBlockTween = nil
+	end
+	blockFrame.Visible = false
+	blockFrame.Size = UDim2.new(1, 0, 1, 0)
+	blockFrame.BackgroundTransparency = BLOCK_TRANSPARENCY
+	sendButton.Active = true
+	sendButton.Interactable = true
+	sendButton.AutoButtonColor = true
+
+	-- show both for cross-fade back
+	callForm.Visible = true
+	confirmFrame.Visible = true
+
+	local exclude = { [blockFrame] = true }
+
+	setChildrenTransparency(callForm, 1, exclude)
+	setChildrenTransparency(confirmFrame, 0, exclude)
+
+	local out = tweenChildrenTransparency(confirmFrame, 1, 0.15, exclude)
+	tweenChildrenTransparency(callForm, 0, 0.15, exclude)
+
+	if out then
+		out.Completed:Connect(function()
+			confirmFrame.Visible = false
+			setChildrenTransparency(confirmFrame, 0)
+		end)
+	else
+		confirmFrame.Visible = false
+	end
+
+	toolbarTabName.Text = "Request assistance"
+
+	submitButton.Active = true
+	submitButton.AutoButtonColor = true
+end
+
+-- Submit button behavior
+submitButton.MouseButton1Click:Connect(function()
+	if IS_MODERATOR then
+		-- Moderators cannot report
+		showTemporaryButtonError(submitButton, "Moderators respond, not report.", 2)
+		return
+	end
+
+	local text = noteInput.Text or ""
+	if text:gsub("%s+", "") == "" then
+		showTemporaryButtonError(submitButton, "Please write a note.", 1.6)
+		return
+	end
+
+	local targetUserId = selectedPlayer and selectedPlayer.UserId or nil
+
+	submitButton.Active = false
+	submitButton.AutoButtonColor = false
+
+	local ok, reason, remaining = validateReport(targetUserId)
+
+	if not ok then
+		submitButton.Active = true
+		submitButton.AutoButtonColor = true
+
+		if reason == "Cooldown" then
+			local msg = "On cooldown"
+			if remaining then
+				msg = string.format("Cooldown (%dm)", math.ceil(remaining / 60))
+			end
+			showTemporaryButtonError(submitButton, msg, 2)
+		elseif reason == "AlreadyReported" then
+			showTemporaryButtonError(submitButton, "You already reported them.", 2)
+		elseif reason == "ModeratorsCantReport" then
+			showTemporaryButtonError(submitButton, "Moderators can't report.", 2)
+		else
+			showTemporaryButtonError(submitButton, "Error, try again.", 2)
+		end
+
+		return
+	end
+
+	-- success, show confirm screen
+	goToConfirm()
+end)
+
+-- Cancel button
+cancelButton.MouseButton1Click:Connect(function()
+	if IS_MODERATOR then return end
+	backToForm()
+end)
+
+-- Send button "Are you sure?" logic
+local confirmWindowSeconds = 0.6
+local sendConfirming = false
+local confirmDeadline = 0
+local sendingReport = false
+
+local function resetSendButton()
+	sendConfirming = false
+	sendButton.Text = "Send"
+end
+
+local function resetForm()
+	if IS_MODERATOR then
+		return
+	end
+
+	if currentBlockTween then
+		currentBlockTween:Cancel()
+		currentBlockTween = nil
+	end
+	blockFrame.Visible = false
+	blockFrame.Size = UDim2.new(1, 0, 1, 0)
+	blockFrame.BackgroundTransparency = BLOCK_TRANSPARENCY
+	sendButton.Active = true
+	sendButton.Interactable = true
+	sendButton.AutoButtonColor = true
+
+	toolbarTabName.Text = "Request assistance"
+
+	-- Clear everything and go back to fresh form
+	noteInput.Text = ""
+	confirmNote.Text = ""
+	selectedPlayer = nil
+	refreshPlayerList()
+
+	confirmPlayerFrame.Visible = false
+
+	callForm.Visible = true
+	callForm.BackgroundTransparency = 1
+	confirmFrame.Visible = false
+
+	submitButton.Active = true
+	submitButton.AutoButtonColor = true
+
+	sendButton.Active = true
+	sendButton.Interactable = true
+	sendButton.AutoButtonColor = true
+	blockFrame.Visible = false
+
+	initSpecialBgToHalf() -- make sure Header/required are back at 0.5 in idle state
+
+	resetSendButton()
+end
+
+local function runLoadingSequence()
+	if IS_MODERATOR then
+		return
+	end
+
+	confirmFrame.Visible = false
+
+	loadingLabel.Visible = true
+	loadingLabel.BackgroundTransparency = 1
+	loadingLabel.TextTransparency = 1
+	loadingLabel.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+	loadingLabel.TextColor3 = Color3.fromRGB(0, 0, 0)
+
+	local tweenIn = TweenService:Create(
+		loadingLabel,
+		TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ BackgroundTransparency = 0, TextTransparency = 0 }
+	)
+
+	loadingLabel.Text = ""
+	tweenIn:Play()
+	tweenIn.Completed:Wait()
+
+	typeText(loadingLabel, "Thank you for your feedback.")
+	task.wait(0.4)
+	eraseText(loadingLabel)
+	typeText(loadingLabel, "Your feedback has alerted moderators and action will be taken!")
+	task.wait(0.6)
+	eraseText(loadingLabel)
+	task.wait(0.6)
+
+	local tweenOut = TweenService:Create(
+		loadingLabel,
+		TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ BackgroundTransparency = 1, TextTransparency = 1 }
+	)
+	tweenOut:Play()
+	resetForm()
+	tweenOut.Completed:Wait()
+
+	loadingLabel.Visible = false
+end
+
+local function sendReportToServer()
+	if IS_MODERATOR then
+		return
+	end
+
+	if sendingReport then
+		return
+	end
+	sendingReport = true
+
+	sendButton.Active = false
+	sendButton.Interactable = false
+	sendButton.AutoButtonColor = false
+
+	local noteText = confirmNote.Text or ""
+	local targetUserId = selectedPlayer and selectedPlayer.UserId or nil
+
+	local ok, result = pcall(function()
+		return submitReportFunc:InvokeServer(targetUserId, noteText)
+	end)
+
+	sendingReport = false
+
+	if not ok or not result or not result.success then
+		sendButton.Active = true
+		sendButton.Interactable = true
+		sendButton.AutoButtonColor = true
+
+		local reason = result and result.reason or "Error"
+		if reason == "Cooldown" then
+			showTemporaryButtonError(sendButton, "On cooldown", 2)
+		elseif reason == "AlreadyReported" then
+			showTemporaryButtonError(sendButton, "Already reported", 2)
+		elseif reason == "NoNote" then
+			showTemporaryButtonError(sendButton, "Note missing", 2)
+		elseif reason == "ModeratorsCantReport" then
+			showTemporaryButtonError(sendButton, "Moderators can't report.", 2)
+		else
+			showTemporaryButtonError(sendButton, "Error sending", 2)
+		end
+
+		resetSendButton()
+		return
+	end
+
+	-- Success
+	runLoadingSequence()
+end
+
+sendButton.MouseButton1Click:Connect(function()
+	if IS_MODERATOR then
+		return
+	end
+
+	if not sendConfirming then
+		sendConfirming = true
+		sendButton.Text = "Are you sure?"
+		confirmDeadline = tick() + confirmWindowSeconds
+
+		task.delay(confirmWindowSeconds, function()
+			if sendConfirming and tick() >= confirmDeadline then
+				resetSendButton()
+			end
+		end)
+	else
+		if tick() <= confirmDeadline then
+			sendReportToServer()
+		else
+			resetSendButton()
+		end
+	end
+end)
+
+--///////////////
+-- Moderator UI
+--///////////////
+
+-- Helper to fill report frames (ReportTemp + ReportDetails.Report)
+local function fillReportFrame(rootFrame: Frame, reportData, includeJoinButton: boolean)
+	if not reportData then return end
+
+	local reporter = reportData.reporter or {}
+	local target = reportData.target
+
+	local reporterDisplay = rootFrame:FindFirstChild("ReporterDisplay", true)
+	local reporterName = rootFrame:FindFirstChild("ReporterName", true)
+	local reporterImage = rootFrame:FindFirstChild("ReporterImg", true)
+	local statsReporter = rootFrame:FindFirstChild("StatsReporter", true)
+
+	if reporterDisplay and reporterDisplay:IsA("TextLabel") then
+		reporterDisplay.Text = reporter.displayName or reporter.DisplayName or reporter.username or reporter.Username or ""
+	end
+
+	if reporterName and reporterName:IsA("TextLabel") then
+		local uname = reporter.username or reporter.Username
+		if uname then
+			reporterName.Text = "@" .. uname
+		else
+			reporterName.Text = "Reporter"
+		end
+	end
+
+	if reporterImage and reporterImage:IsA("ImageLabel") and reporter.userId then
+		local ok, content = pcall(function()
+			return Players:GetUserThumbnailAsync(
+				reporter.userId,
+				Enum.ThumbnailType.HeadShot,
+				Enum.ThumbnailSize.Size100x100
+			)
+		end)
+		if ok then
+			reporterImage.Image = content
+		end
+	end
+
+	if statsReporter and statsReporter:IsA("Frame") then
+		local killsLabel = statsReporter:FindFirstChild("Kills")
+		local euroLabel = statsReporter:FindFirstChild("Euro")
+		if killsLabel and killsLabel:IsA("TextLabel") then
+			killsLabel.Text = tostring(reporter.kills or reporter.Kills or "N/A")
+		end
+		if euroLabel and euroLabel:IsA("TextLabel") then
+			euroLabel.Text = tostring(reporter.euro or reporter.Euro or "N/A")
+		end
+	end
+
+	local reportedDetails = rootFrame:FindFirstChild("ReportedDetails", true)
+	local statsReported = rootFrame:FindFirstChild("StatsReported", true)
+
+	if not reportData.hasReportedPlayer or not target then
+		if reportedDetails and reportedDetails:IsA("Frame") then
+			reportedDetails.Visible = false
+		end
+		if statsReported and statsReported:IsA("Frame") then
+			statsReported.Visible = false
+		end
+	else
+		if reportedDetails and reportedDetails:IsA("Frame") then
+			reportedDetails.Visible = true
+		end
+		if statsReported and statsReported:IsA("Frame") then
+			statsReported.Visible = true
+		end
+
+		local reportedDisplay = rootFrame:FindFirstChild("ReportedDisplay", true)
+		local reportedName = rootFrame:FindFirstChild("ReportedName", true)
+		local reportedImage = rootFrame:FindFirstChild("ReportedImg", true)
+
+		if reportedDisplay and reportedDisplay:IsA("TextLabel") then
+			reportedDisplay.Text = target.displayName or target.DisplayName or target.username or target.Username or ""
+		end
+		if reportedName and reportedName:IsA("TextLabel") then
+			local uname = target.username or target.Username
+			if uname then
+				reportedName.Text = "@" .. uname
+			else
+				reportedName.Text = "UserId: " .. tostring(target.userId or target.UserId or "?")
+			end
+		end
+		if reportedImage and reportedImage:IsA("ImageLabel") and (target.userId or target.UserId) then
+			local idValue = target.userId or target.UserId
+			local okImg, content = pcall(function()
+				return Players:GetUserThumbnailAsync(
+					idValue,
+					Enum.ThumbnailType.HeadShot,
+					Enum.ThumbnailSize.Size100x100
+				)
+			end)
+			if okImg then
+				reportedImage.Image = content
+			end
+		end
+
+		if statsReported and statsReported:IsA("Frame") then
+			local rkills = statsReported:FindFirstChild("Kills")
+			local reuro = statsReported:FindFirstChild("Euro")
+			local rreports = statsReported:FindFirstChild("Reports")
+
+			if rkills and rkills:IsA("TextLabel") then
+				rkills.Text = tostring(target.kills or target.Kills or "N/A")
+			end
+			if reuro and reuro:IsA("TextLabel") then
+				reuro.Text = tostring(target.euro or target.Euro or "N/A")
+			end
+			if rreports and rreports:IsA("TextLabel") then
+				local count = reportData.targetReportCount or target.reportCount or target.Reports
+				if count == nil then
+					count = "N/A"
+				end
+				rreports.Text = tostring(count)
+			end
+		end
+	end
+
+	local noteBox = rootFrame:FindFirstChild("Note", true)
+	if noteBox and (noteBox:IsA("TextBox") or noteBox:IsA("TextLabel")) then
+		noteBox.Text = reportData.note or ""
+	end
+
+	if not includeJoinButton then
+		local joinButtonInside = rootFrame:FindFirstChild("Join", true)
+		if joinButtonInside and joinButtonInside:IsA("TextButton") then
+			joinButtonInside.Visible = false
+			joinButtonInside.Active = false
+		end
+	end
+end
+
+-- [reportId] = { id, row, detailFrame, open, baseText, data }
+local moderatorReportEntries = {}
+
+local reportsScrollFrame = reportsRoot:WaitForChild("ReportsFrame")
+local rowTemplate = reportsRoot:WaitForChild("Row")
+local reportTempTemplate = reportsRoot:WaitForChild("ReportTemp")
+local joinIdTextBox = reportsRoot:WaitForChild("JoinId")
+local joinButton = reportsRoot:WaitForChild("Join")
+local noReportsFrame = reportsRoot:WaitForChild("noReports")
+
+local function ensureReportsLayout()
+	local layout2 = reportsScrollFrame:FindFirstChildOfClass("UIListLayout")
+	if not layout2 then
+		layout2 = Instance.new("UIListLayout")
+		layout2.SortOrder = Enum.SortOrder.LayoutOrder
+		layout2.Padding = UDim.new(0, 4)
+		layout2.Parent = reportsScrollFrame
+	end
+	return layout2
+end
+
+local function updateReportsCanvasSize()
+	local layout2 = ensureReportsLayout()
+	local absContentSize = layout2.AbsoluteContentSize
+	reportsScrollFrame.CanvasSize = UDim2.new(0, 0, 0, absContentSize.Y + 10)
+end
+
+ensureReportsLayout()
+reportsScrollFrame:GetPropertyChangedSignal("AbsoluteCanvasSize"):Connect(updateReportsCanvasSize)
+
+local currentReportData = nil :: any
+
+local function clearModeratorReportEntries()
+	for _, entry in pairs(moderatorReportEntries) do
+		if entry.row then
+			entry.row:Destroy()
+		end
+		if entry.detailFrame then
+			entry.detailFrame:Destroy()
+		end
+	end
+	table.clear(moderatorReportEntries)
+	updateReportsCanvasSize()
+end
+
+local function createReportJoinHandler(button: TextButton, joinId: string)
+	local confirmWindow = 0.6
+	local confirming = false
+	local deadline = 0
+
+	local function resetButton()
+		confirming = false
+		button.Text = "Join"
+	end
+
+	button.MouseButton1Click:Connect(function()
+		if not IS_MODERATOR then
+			return
+		end
+
+		if not confirming then
+			confirming = true
+			deadline = tick() + confirmWindow
+			button.Text = "Are you sure?"
+			task.delay(confirmWindow, function()
+				if confirming and tick() >= deadline then
+					resetButton()
+				end
+			end)
+		else
+			if tick() <= deadline then
+				local ok, result = pcall(function()
+					return joinReportFunc:InvokeServer(joinId)
+				end)
+				resetButton()
+
+				if not ok or not result or not result.success then
+					local reason = result and result.reason or "Error"
+					local msg = "Error"
+					if reason == "InvalidJoinId" then
+						msg = "Invalid JoinId"
+					elseif reason == "ServerClosed" then
+						msg = "Server closed"
+					elseif reason == "NotModerator" then
+						msg = "Not moderator"
+					end
+					showTemporaryButtonError(button, msg, 1.8)
+				else
+					-- Teleport happens; nothing else to do here.
+				end
+			else
+				resetButton()
+			end
+		end
+	end)
+end
+
+local function createModeratorReportEntry(reportData, index)
+	-- Use reportData.id as the stable identity for diffing
+	local reportId = reportData.id
+	if reportId == nil then
+		warn("Report without id from server:", reportData)
+		reportId = "temp_" .. tostring(index)
+	end
+
+	-- If an entry for this report already exists, don't recreate it here.
+	-- The refresh function will update it instead.
+	if moderatorReportEntries[reportId] then
+		return moderatorReportEntries[reportId]
+	end
+
+	local cloneRow = rowTemplate:Clone()
+	cloneRow.Visible = true
+	cloneRow.Name = "ReportRow_" .. tostring(reportId)
+	cloneRow.LayoutOrder = index * 2
+	cloneRow.TextXAlignment = Enum.TextXAlignment.Left
+
+	local baseText = reportData.baseText or ("Report #" .. tostring(reportId))
+	cloneRow.Text = "▶ " .. baseText
+	cloneRow.Parent = reportsScrollFrame
+
+	local entry = {
+		id = reportId,
+		row = cloneRow,
+		detailFrame = nil,
+		open = false,
+		baseText = baseText,
+		data = reportData,
+	}
+	moderatorReportEntries[reportId] = entry
+
+	local function closeEntry()
+		if not entry.open then return end
+		entry.open = false
+		if entry.row then
+			entry.row.Text = "▶ " .. entry.baseText
+		end
+		if entry.detailFrame then
+			entry.detailFrame:Destroy()
+			entry.detailFrame = nil
+		end
+		updateReportsCanvasSize()
+	end
+
+	local function openEntry()
+		if entry.open then
+			closeEntry()
+			return
+		end
+
+		-- Close all others so only one is open at a time
+		for _, other in pairs(moderatorReportEntries) do
+			if other ~= entry and other.open then
+				if other.detailFrame then
+					other.detailFrame:Destroy()
+					other.detailFrame = nil
+				end
+				other.open = false
+				if other.row then
+					other.row.Text = "▶ " .. other.baseText
+				end
+			end
+		end
+
+		entry.open = true
+		if entry.row then
+			entry.row.Text = "▼ " .. entry.baseText
+		end
+
+		local tempClone = reportTempTemplate:Clone()
+		tempClone.Name = "ReportDetails_" .. tostring(reportId)
+		tempClone.Visible = true
+		tempClone.LayoutOrder = (entry.row and entry.row.LayoutOrder or index * 2) + 1
+		tempClone.Parent = reportsScrollFrame
+
+		entry.detailFrame = tempClone
+
+		-- Fill details
+		fillReportFrame(tempClone, reportData, true)
+
+		-- Wire up the join button inside this report
+		local joinBtnInside = tempClone:FindFirstChild("Join", true)
+		if joinBtnInside and joinBtnInside:IsA("TextButton") then
+			createReportJoinHandler(joinBtnInside, reportData.joinId)
+		end
+
+		updateReportsCanvasSize()
+	end
+
+	cloneRow.MouseButton1Click:Connect(function()
+		if not IS_MODERATOR then return end
+		openEntry()
+	end)
+
+	return entry
+end
+
+local function refreshModeratorReportsList()
+	if not IS_MODERATOR then
+		return
+	end
+
+	-- Remember scroll position so refresh doesn't jump the view
+	local oldCanvasPosition = reportsScrollFrame.CanvasPosition
+
+	if noReportsFrame then
+		noReportsFrame.Visible = false
+	end
+
+	local ok, result = pcall(function()
+		return getReportsFunc:InvokeServer()
+	end)
+
+	if not ok or not result or not result.success then
+		warn("GetModeratorReports failed:", result)
+		-- Only show "noReports" if we currently have none in the UI
+		if noReportsFrame and next(moderatorReportEntries) == nil then
+			noReportsFrame.Visible = true
+		end
+		return
+	end
+
+	local list = result.reports or {}
+
+	-- "No reports" label based on fresh data
+	if noReportsFrame then
+		noReportsFrame.Visible = (#list == 0)
+	end
+
+	-- Track which report ids are still present after this refresh
+	local seenIds = {}
+	local index = 0
+
+	for _, reportData in ipairs(list) do
+		local reportId = reportData.id
+		if reportId ~= nil then
+			index += 1
+			seenIds[reportId] = true
+
+			local entry = moderatorReportEntries[reportId]
+			if entry then
+				-- Existing report -> update only, do NOT destroy it
+				entry.data = reportData
+				entry.baseText = reportData.baseText or ("Report #" .. tostring(reportId))
+
+				if entry.row then
+					local prefix = entry.open and "▼ " or "▶ "
+					entry.row.Text = prefix .. entry.baseText
+					entry.row.LayoutOrder = index * 2
+				end
+
+				if entry.detailFrame then
+					entry.detailFrame.LayoutOrder = index * 2 + 1
+					-- Refresh the detail info, but keep it open
+					fillReportFrame(entry.detailFrame, reportData, true)
+				end
+			else
+				-- New report -> create row
+				createModeratorReportEntry(reportData, index)
+			end
+		end
+	end
+
+	-- Remove entries that are no longer in the server's list
+	for reportId, entry in pairs(moderatorReportEntries) do
+		if not seenIds[reportId] then
+			if entry.row then
+				entry.row:Destroy()
+			end
+			if entry.detailFrame then
+				entry.detailFrame:Destroy()
+			end
+			moderatorReportEntries[reportId] = nil
+		end
+	end
+	
+	-- 👇 add this block:
+	if currentReportData and currentReportData.id then
+		if not seenIds[currentReportData.id] then
+			-- The report we’re viewing in details no longer exists (dismissed or server closed)
+			if reportDetailsFrame.Visible then
+				reportDetailsFrame.Visible = false
+				reportsRoot.Visible = true
+				toolbarTabName.Text = "Reports"
+				currentReportData = nil
+			end
+		end
+	end
+
+	updateReportsCanvasSize()
+	reportsScrollFrame.CanvasPosition = oldCanvasPosition
+end
+
+-- Join button at top using JoinId textbox
+do
+	local confirmWindow = 0.6
+	local confirming = false
+	local deadline = 0
+
+	local function resetButton()
+		confirming = false
+		joinButton.Text = "Join"
+	end
+
+	joinButton.MouseButton1Click:Connect(function()
+		if not IS_MODERATOR then
+			showTemporaryButtonError(joinButton, "Moderator only", 1.6)
+			return
+		end
+
+		local joinId = (joinIdTextBox.Text or ""):gsub("%s+", "")
+		if joinId == "" then
+			showTemporaryButtonError(joinButton, "Insert JoinId", 1.5)
+			return
+		end
+
+		if not confirming then
+			confirming = true
+			deadline = tick() + confirmWindow
+			joinButton.Text = "Are you sure?"
+			task.delay(confirmWindow, function()
+				if confirming and tick() >= deadline then
+					resetButton()
+				end
+			end)
+		else
+			if tick() <= deadline then
+				local ok, result = pcall(function()
+					return joinReportFunc:InvokeServer(joinId)
+				end)
+				resetButton()
+
+				if not ok or not result or not result.success then
+					local reason = result and result.reason or "Error"
+					local msg = "Error"
+					if reason == "InvalidJoinId" then
+						msg = "Invalid JoinId"
+					elseif reason == "ServerClosed" then
+						msg = "Server closed"
+					elseif reason == "NotModerator" then
+						msg = "Not moderator"
+					end
+					showTemporaryButtonError(joinButton, msg, 1.8)
+				else
+					-- Teleport is happening now
+				end
+			else
+				resetButton()
+			end
+		end
+	end)
+end
+
+-- One-shot block animation for the dismiss button when typing a resolution note
+local function triggerDismissBlockAnimation()
+	if dismissBlockPlayed then
+		return
+	end
+	dismissBlockPlayed = true
+
+	if dismissBlockTween then
+		dismissBlockTween:Cancel()
+		dismissBlockTween = nil
+	end
+
+	dismissBlockFrame.Visible = true
+	dismissBlockFrame.Size = UDim2.new(1, 0, 1, 0)
+	dismissBlockFrame.BackgroundTransparency = BLOCK_TRANSPARENCY
+
+	local tween = TweenService:Create(
+		dismissBlockFrame,
+		TweenInfo.new(3, Enum.EasingStyle.Linear, Enum.EasingDirection.Out),
+		{ Size = UDim2.new(0, 0, 1, 0) }
+	)
+	dismissBlockTween = tween
+	tween:Play()
+
+	tween.Completed:Connect(function()
+		if dismissBlockTween ~= tween then
+			return
+		end
+		dismissBlockTween = nil
+		dismissButton.Interactable = true
+		dismissButton.Active = true
+		dismissBlockFrame.Visible = false
+	end)
+end
+
+-- Trigger block animation when typing in resolution note (only once per opened report)
+resolutionNoteInput:GetPropertyChangedSignal("Text"):Connect(function()
+	if dismissBlockPlayed then
+		return
+	end
+
+	local txt = resolutionNoteInput.Text or ""
+	if txt:gsub("%s+", "") ~= "" then
+		triggerDismissBlockAnimation()
+	end
+end)
+
+-- When a moderator is teleported with joinId/jobId, show ReportDetails
+local function openReportDetails(reportData)
+	if not IS_MODERATOR then
+		return
+	end
+
+	currentReportData = reportData
+	
+	app.Parent.AnchorPoint = Vector2.new(0.5, 0.5)
+	app.Parent.Position = UDim2.new(0.5, 0, 0.5, 0)
+
+	-- Reset resolution note & block animation state for this report
+	resolutionNoteInput.Text = ""
+	dismissBlockPlayed = false
+	if dismissBlockTween then
+		dismissBlockTween:Cancel()
+		dismissBlockTween = nil
+	end
+	dismissBlockFrame.Visible = true
+	dismissBlockFrame.Size = UDim2.new(1, 0, 1, 0)
+	dismissBlockFrame.BackgroundTransparency = BLOCK_TRANSPARENCY
+
+	-- Hide other frames
+	callForm.Visible = false
+	confirmFrame.Visible = false
+	loadingLabel.Visible = false
+	reportsRoot.Visible = false
+	
+	dismissButton.Interactable = false
+	dismissButton.Active = false
+
+	reportDetailsFrame.Visible = true
+
+	toolbarTabName.Text = "Report details"
+
+	-- Header label: "Report #x at (time) - ..."
+	local headerLabel = reportDetailsFrame:WaitForChild("Header") :: TextLabel
+	headerLabel.Text = reportData.baseText or ("Report #" .. tostring(reportData.id))
+
+	local reportFrame = reportDetailsFrame:WaitForChild("Report") :: Frame
+	fillReportFrame(reportFrame, reportData, false)
+
+	-- Wait 2 seconds, then open the app container
+	task.delay(2, function()
+		local parent = app.Parent
+		local top = parent and parent.Parent
+		if top then
+			local openBool = top:FindFirstChild("openBool")
+			if openBool and openBool:IsA("BoolValue") then
+				openBool.Value = true
+			end
+		end
+	end)
+end
+
+openReportDetailsEvent.OnClientEvent:Connect(function(reportData)
+	openReportDetails(reportData)
+end)
+
+-- Dismiss button in ReportDetails
+do
+	local confirmWindow = 0.6
+	local confirming = false
+	local deadline = 0
+
+	local function resetDismissButton()
+		confirming = false
+		dismissButton.Text = "Dismiss"
+	end
+
+	dismissButton.MouseButton1Click:Connect(function()
+		if not IS_MODERATOR then
+			return
+		end
+
+		if not currentReportData or not currentReportData.joinId then
+			showTemporaryButtonError(dismissButton, "No report", 1.5)
+			return
+		end
+
+		if not confirming then
+			confirming = true
+			deadline = tick() + confirmWindow
+			dismissButton.Text = "Are you sure?"
+			task.delay(confirmWindow, function()
+				if confirming and tick() >= deadline then
+					resetDismissButton()
+				end
+			end)
+		else
+			if tick() <= deadline then
+				local joinId = currentReportData.joinId
+				local resolutionNoteText = resolutionNoteInput.Text or ""
+
+				local ok, result = pcall(function()
+					return dismissReportFunc:InvokeServer(joinId, resolutionNoteText)
+				end)
+
+				if not ok or not result or not result.success then
+					resetDismissButton()
+					local reason = result and result.reason or "Error"
+					local msg = "Error"
+					if reason == "DataStoreError" then
+						msg = "Dismiss failed"
+					elseif reason == "InvalidJoinId" then
+						msg = "Already dismissed"
+					end
+					showTemporaryButtonError(dismissButton, msg, 1.6)
+					return
+				end
+
+				resetDismissButton()
+				currentReportData = nil
+
+				-- Go back to report list and refresh
+				reportDetailsFrame.Visible = false
+				reportsRoot.Visible = true
+				toolbarTabName.Text = "Reports"
+				refreshModeratorReportsList()
+			else
+				resetDismissButton()
+			end
+		end
+	end)
+end
+
+-- //////////////////////////////////////////////
+-- // MOD NOTIFICATION SOUND (NotifyPlayer)
+-- //////////////////////////////////////////////
+
+notifyEvent.OnClientEvent:Connect(function(title, subtitle, icon, duration)
+	-- Only moderators should react to this sound
+	if not IS_MODERATOR then
+		return
+	end
+
+	-- Only play for report notifications
+	if title ~= "Reports" then
+		return
+	end
+
+	local sound = Instance.new("Sound")
+	sound.SoundId = "rbxassetid://9117305779"
+	sound.Volume = 1
+	sound.Looped = false
+	sound.Parent = guiParent
+	sound:Play()
+	sound.Ended:Connect(function()
+		sound:Destroy()
+	end)
+end)
+
+-- ///////////////////////////////////////////////////////////
+-- // AUTOMATIC REFRESH LOGIC
+-- ///////////////////////////////////////////////////////////
+
+local REFRESH_RATE = 5 -- Change this to 1 or 5 (Seconds)
+
+--///////////////
+-- Initial visibility
+--///////////////
+
+confirmFrame.Visible = false
+loadingLabel.Visible = false
+
+if IS_MODERATOR then
+	-- Moderators: only see the report browser / details
+	callForm.Visible = false
+	reportsRoot.Visible = true
+	reportDetailsFrame.Visible = false
+	toolbarTabName.Text = "Reports"
+
+	refreshModeratorReportsList()
+
+	task.spawn(function()
+		while true do
+			task.wait(REFRESH_RATE)
+			if reportsRoot.Visible then
+				refreshModeratorReportsList()
+			end
+		end
+	end)
+else
+	-- Normal players: call form and confirmation flow
+	callForm.Visible = true
+	reportsRoot.Visible = false
+	reportDetailsFrame.Visible = false
+	toolbarTabName.Text = "Request assistance"
+end
