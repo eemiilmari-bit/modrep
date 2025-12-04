@@ -1289,16 +1289,18 @@ local function refreshModeratorReportsList()
 	end
 	
         -- 👇 add this block:
-        if currentReportData and currentReportData.id then
-                if not seenIds[currentReportData.id] then
-                        -- The report we’re viewing in details no longer exists (dismissed or server closed)
-                        if reportDetailsFrame.Visible then
-                                reportDetailsFrame.Visible = false
-                                reportsRoot.Visible = true
-                                toolbarTabName.Text = "Reports"
-                                stopTimer()
-                                currentReportData = nil
-                        end
+        if currentReportData and currentReportData.id and reportDetailsFrame.Visible then
+                local claimedAt = tonumber(currentReportData.claimedAt)
+                local claimAge = claimedAt and (os.time() - claimedAt) or nil
+                local claimLocked = claimAge and claimAge < CLAIM_TIMEOUT_SECONDS
+
+                -- Only auto-close the details view if the report should be visible to others (not claim-locked)
+                if not seenIds[currentReportData.id] and not claimLocked then
+                        reportDetailsFrame.Visible = false
+                        reportsRoot.Visible = true
+                        toolbarTabName.Text = "Reports"
+                        stopTimer()
+                        currentReportData = nil
                 end
         end
 
